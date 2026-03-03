@@ -624,12 +624,12 @@ export async function getUsage(): Promise<UsageResult> {
         } else {
           // Refresh failed - auth error
           writeCache(null, true, 'anthropic');
-          return { data: null, error: 'auth' };
+          return { rateLimits: null, error: 'auth' };
         }
       } else {
         // No refresh token available - auth error
         writeCache(null, true, 'anthropic');
-        return { data: null, error: 'auth' };
+        return { rateLimits: null, error: 'auth' };
       }
     }
 

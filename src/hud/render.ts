@@ -172,8 +172,6 @@ export async function render(context: HudRenderContext, config: HudConfig): Prom
       if (limits) elements.push(limits);
     }
   }
-    }
-  }
 
   // Custom rate limit buckets
   if (context.customBuckets) {

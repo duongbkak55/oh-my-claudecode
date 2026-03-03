@@ -404,7 +404,7 @@ async function processKeywordDetector(input: HookInput): Promise<HookOutput> {
           const projectName = basename(directory);
           let branchName = 'ralph/task';
           try {
-            branchName = execSync('git rev-parse --abbrev-ref HEAD', { cwd: directory, encoding: 'utf-8' }).trim();
+            branchName = execSync('git rev-parse --abbrev-ref HEAD', { cwd: directory, encoding: 'utf-8', timeout: 5000 }).trim();
           } catch {
             // Not a git repo or git not available — use fallback
           }
@@ -1115,7 +1115,7 @@ async function processPostToolUse(input: HookInput): Promise<HookOutput> {
         const projectName = basename(directory);
         let branchName = 'ralph/task';
         try {
-          branchName = execSync('git rev-parse --abbrev-ref HEAD', { cwd: directory, encoding: 'utf-8' }).trim();
+          branchName = execSync('git rev-parse --abbrev-ref HEAD', { cwd: directory, encoding: 'utf-8', timeout: 5000 }).trim();
         } catch {
           // Not a git repo or git not available — use fallback
         }

@@ -62,6 +62,7 @@ export function getWorktreeRoot(cwd?: string): string | null {
       cwd: effectiveCwd,
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 5000,
     }).trim();
 
     // Evict oldest entry when at capacity

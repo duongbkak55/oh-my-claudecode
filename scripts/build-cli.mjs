@@ -12,9 +12,7 @@ await esbuild.build({
   target: 'node18',
   format: 'cjs',
   outfile,
-  banner: {
-    js: '#!/usr/bin/env node',
-  },
+  // Note: shebang is preserved from entry file, no banner needed
   external: [
     'fs', 'fs/promises', 'path', 'os', 'util', 'stream', 'events',
     'buffer', 'crypto', 'http', 'https', 'url',

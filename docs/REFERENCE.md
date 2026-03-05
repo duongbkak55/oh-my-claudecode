@@ -220,9 +220,9 @@ Supported entrypoints: direct start (`omc team [N:agent] "<task>"`), `status`, `
 
 ---
 
-## Legacy MCP Team Runtime Tools (Deprecated)
+## Legacy MCP Team Runtime Tools (Deprecated, Opt-In Only)
 
-The Team MCP server remains registered for compatibility, but runtime tools are now **CLI-only deprecated** and return a deterministic error envelope:
+The Team MCP runtime server is **not enabled by default**. If manually enabled, runtime tools are still **CLI-only deprecated** and return a deterministic error envelope:
 
 ```json
 {
@@ -239,6 +239,19 @@ Use `omc team ...` replacements instead:
 | `omc_run_team_status`  | **Deprecated** → `omc team status <team-name>`             |
 | `omc_run_team_wait`    | **Deprecated** → monitor via `omc team status <team-name>` |
 | `omc_run_team_cleanup` | **Deprecated** → `omc team shutdown <team-name> [--force]` |
+
+Optional compatibility enablement (manual only):
+
+```json
+{
+  "mcpServers": {
+    "team": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/bridge/team-mcp.cjs"]
+    }
+  }
+}
+```
 
 ### Runtime status semantics
 

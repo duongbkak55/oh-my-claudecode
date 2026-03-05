@@ -674,6 +674,21 @@ export async function killTeamSession(sessionName, workerPaneIds, leaderPaneId) 
         }
         return;
     }
+    // Safety guard: never kill the current attached tmux session unless
+    // explicitly overridden. This prevents intermittent self-session termination
+    // when callers pass an incorrect/non-owned session name.
+    if (process.env.OMC_TEAM_ALLOW_KILL_CURRENT_SESSION !== '1' && process.env.TMUX) {
+        try {
+            const current = await tmuxAsync(['display-message', '-p', '#S']);
+            const currentSessionName = current.stdout.trim();
+            if (currentSessionName && currentSessionName === sessionName) {
+                return;
+            }
+        }
+        catch {
+            // If we cannot resolve current session safely, continue with best effort.
+        }
+    }
     // Session mode: this session is fully owned by the team
     try {
         await execFileAsync('tmux', ['kill-session', '-t', sessionName]);

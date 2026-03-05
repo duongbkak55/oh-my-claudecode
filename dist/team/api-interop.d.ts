@@ -13,7 +13,8 @@ export type TeamApiEnvelope = {
         message: string;
     };
 };
+export declare function resolveTeamApiCliCommand(env?: NodeJS.ProcessEnv): 'omc team api' | 'omx team api';
 export declare function resolveTeamApiOperation(name: string): TeamApiOperation | null;
-export declare function buildLegacyTeamDeprecationHint(legacyName: string, originalArgs?: Record<string, unknown>): string;
+export declare function buildLegacyTeamDeprecationHint(legacyName: string, originalArgs?: Record<string, unknown>, env?: NodeJS.ProcessEnv): string;
 export declare function executeTeamApiOperation(operation: TeamApiOperation, args: Record<string, unknown>, fallbackCwd: string): Promise<TeamApiEnvelope>;
 //# sourceMappingURL=api-interop.d.ts.map

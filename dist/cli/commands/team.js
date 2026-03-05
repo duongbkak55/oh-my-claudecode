@@ -1,7 +1,7 @@
 /**
  * omc team CLI subcommand
  *
- * Full team lifecycle matching OMX's `omx team` interface:
+ * Full team lifecycle for `omc team`:
  *   omc team [N:agent-type] "task"          Start team (spawns tmux worker panes)
  *   omc team status <team-name>             Monitor team status
  *   omc team shutdown <team-name> [--force] Shutdown team
@@ -258,7 +258,7 @@ async function handleTeamStart(parsed, cwd) {
             owner: `worker-${i + 1}`,
         });
     }
-    // Use v2 runtime if enabled, otherwise fall back to v1
+    // Use v2 runtime by default (OMC_RUNTIME_V2 opt-out), otherwise fall back to v1
     const { isRuntimeV2Enabled } = await import('../../team/runtime-v2.js');
     if (isRuntimeV2Enabled()) {
         const { startTeamV2, monitorTeamV2 } = await import('../../team/runtime-v2.js');

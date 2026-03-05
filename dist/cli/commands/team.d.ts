@@ -1,7 +1,7 @@
 /**
  * omc team CLI subcommand
  *
- * Full team lifecycle matching OMX's `omx team` interface:
+ * Full team lifecycle for `omc team`:
  *   omc team [N:agent-type] "task"          Start team (spawns tmux worker panes)
  *   omc team status <team-name>             Monitor team status
  *   omc team shutdown <team-name> [--force] Shutdown team

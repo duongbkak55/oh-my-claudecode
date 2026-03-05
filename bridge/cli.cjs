@@ -21443,6 +21443,16 @@ async function killTeamSession(sessionName2, workerPaneIds, leaderPaneId) {
     }
     return;
   }
+  if (process.env.OMC_TEAM_ALLOW_KILL_CURRENT_SESSION !== "1" && process.env.TMUX) {
+    try {
+      const current = await tmuxAsync(["display-message", "-p", "#S"]);
+      const currentSessionName = current.stdout.trim();
+      if (currentSessionName && currentSessionName === sessionName2) {
+        return;
+      }
+    } catch {
+    }
+  }
   try {
     await execFileAsync5("tmux", ["kill-session", "-t", sessionName2]);
   } catch {
@@ -21599,8 +21609,9 @@ __export(runtime_v2_exports, {
 });
 function isRuntimeV2Enabled(env2 = process.env) {
   const raw = env2.OMC_RUNTIME_V2;
-  if (!raw) return false;
-  return ["1", "true", "yes"].includes(raw.trim().toLowerCase());
+  if (!raw) return true;
+  const normalized = raw.trim().toLowerCase();
+  return !["0", "false", "no", "off"].includes(normalized);
 }
 function sanitizeTeamName(name) {
   return name.replace(/[^a-z0-9-]/g, "").slice(0, 30);
@@ -22047,11 +22058,6 @@ async function shutdownTeamV2(teamName, cwd2, options = {}) {
   const sanitized = sanitizeTeamName(teamName);
   const config2 = await readTeamConfig(sanitized, cwd2);
   if (!config2) {
-    try {
-      const { killTeamSession: killTeamSession2 } = await Promise.resolve().then(() => (init_tmux_session(), tmux_session_exports));
-      await killTeamSession2(`omc-team-${sanitized}`, [], void 0);
-    } catch {
-    }
     await cleanupTeamState(sanitized, cwd2);
     return;
   }
@@ -62109,6 +62115,13 @@ function parseTeamWorkerEnv(raw) {
   if (!match) return null;
   return { teamName: match[1], workerName: match[2] };
 }
+function parseTeamWorkerContextFromEnv(env2 = process.env) {
+  return parseTeamWorkerEnv(env2.OMC_TEAM_WORKER) ?? parseTeamWorkerEnv(env2.OMX_TEAM_WORKER);
+}
+function readTeamStateRootFromEnv(env2 = process.env) {
+  const candidate = typeof env2.OMC_TEAM_STATE_ROOT === "string" && env2.OMC_TEAM_STATE_ROOT.trim() !== "" ? env2.OMC_TEAM_STATE_ROOT.trim() : typeof env2.OMX_TEAM_STATE_ROOT === "string" && env2.OMX_TEAM_STATE_ROOT.trim() !== "" ? env2.OMX_TEAM_STATE_ROOT.trim() : "";
+  return candidate || null;
+}
 function readTeamStateRootFromFile(path20) {
   if (!(0, import_node_fs3.existsSync)(path20)) return null;
   try {
@@ -62138,7 +62151,7 @@ function resolveTeamWorkingDirectoryFromMetadata(teamName, candidateCwd, workerC
 function resolveTeamWorkingDirectory(teamName, preferredCwd) {
   const normalizedTeamName = String(teamName || "").trim();
   if (!normalizedTeamName) return preferredCwd;
-  const envTeamStateRoot = process.env.OMC_TEAM_STATE_ROOT;
+  const envTeamStateRoot = readTeamStateRootFromEnv();
   if (typeof envTeamStateRoot === "string" && envTeamStateRoot.trim() !== "") {
     return stateRootToWorkingDirectory(envTeamStateRoot.trim());
   }
@@ -62147,7 +62160,7 @@ function resolveTeamWorkingDirectory(teamName, preferredCwd) {
     if (typeof seed !== "string" || seed.trim() === "") continue;
     if (!seeds.includes(seed)) seeds.push(seed);
   }
-  const workerContext = parseTeamWorkerEnv(process.env.OMC_TEAM_WORKER);
+  const workerContext = parseTeamWorkerContextFromEnv();
   for (const seed of seeds) {
     let cursor = seed;
     while (cursor) {

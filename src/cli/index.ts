@@ -1419,7 +1419,7 @@ program
 
 /**
  * Team command - CLI API for team worker lifecycle operations
- * Mirrors OMX's `omx team api` interface exactly.
+ * Exposes OMC's `omc team api` interface.
  *
  * helpOption(false) prevents commander from intercepting --help;
  * our teamCommand handler provides its own help output.

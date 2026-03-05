@@ -72,7 +72,6 @@ External AI (tmux CLI workers):
 - Provider advisor CLI: `omc ask <claude|codex|gemini> ...` (writes artifacts to `.omc/artifacts/ask/`)
 - Ask shortcuts: `/oh-my-claudecode:ask-codex` and `/oh-my-claudecode:ask-gemini` route to the same `omc ask` flow
 - CCG skill route: `/oh-my-claudecode:ccg` fans out via `ask-codex` + `ask-gemini`, then Claude synthesizes
-- Legacy MCP runtime tools (`omc_run_team_*`) are deprecated with `deprecated_cli_only` and should not be used for execution.
 
 OMC State: `state_read`, `state_write`, `state_clear`, `state_list_active`, `state_get_status`
 
@@ -100,7 +99,6 @@ Workflow:
 - `ralph` ("ralph", "don't stop", "must complete"): self-referential loop with verifier verification; includes ultrawork
 - `ultrawork` ("ulw", "ultrawork"): maximum parallelism with parallel agent orchestration
 - `team` ("team", "coordinated team", "team ralph"): N coordinated Claude agents with stage-aware routing; `team ralph` for persistent team execution
-- `omc-teams` ("omc-teams"): legacy alias that routes to CLI-first `omc team ...` worker execution
 - `ccg` ("ccg", "tri-model", "claude codex gemini"): fan out via `ask-codex` + `ask-gemini`, then Claude synthesizes
 - `ultraqa` (activated by autopilot): QA cycling -- test, verify, fix, repeat
 - `omc-plan` (manual command): strategic planning; supports `--consensus` and `--review`
@@ -121,7 +119,7 @@ Agent Shortcuts (thin wrappers):
 Notifications: `configure-notifications` ("configure discord", "setup telegram", "configure slack")
 Utilities: `ask-codex`, `ask-gemini`, `cancel`, `note`, `learner`, `omc-setup`, `mcp-setup`, `hud`, `omc-doctor`, `omc-help`, `trace`, `release`, `project-session-manager`, `skill`, `writer-memory`, `ralph-init`, `learn-about-omc`
 
-Disambiguation: prompts like "ask/use/delegate to codex|gemini" -> `ask-codex` / `ask-gemini`; "claude codex gemini" -> ccg. `omc-teams` remains available for explicit CLI-worker execution.
+Disambiguation: prompts like "ask/use/delegate to codex|gemini" -> `ask-codex` / `ask-gemini`; "claude codex gemini" -> ccg.
 </skills>
 
 <team_pipeline>

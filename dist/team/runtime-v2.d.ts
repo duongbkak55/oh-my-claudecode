@@ -1,7 +1,9 @@
 /**
  * Event-driven team runtime v2 — replaces the polling watchdog from runtime.ts.
  *
- * Feature-flagged via OMC_RUNTIME_V2=1 environment variable.
+ * Runtime selection:
+ * - Default: v2 enabled
+ * - Opt-out: set OMC_RUNTIME_V2=0|false|no|off to force legacy v1
  * NO done.json polling. Completion is detected via:
  * - CLI API lifecycle transitions (claim-task, transition-task-status)
  * - Event-driven monitor snapshots
@@ -10,7 +12,7 @@
  * Preserves: sentinel gate, circuit breaker, failure sidecars.
  * Removes: done.json watchdog loop, sleep-based polling.
  *
- * Architecture matches OMX runtime.ts: startTeam, monitorTeam, shutdownTeam,
+ * Architecture mirrors runtime.ts: startTeam, monitorTeam, shutdownTeam,
  * assignTask, resumeTeam as discrete operations driven by the caller.
  */
 import type { TeamConfig, TeamTask, WorkerStatus, WorkerHeartbeat } from './types.js';
@@ -107,7 +109,7 @@ export declare function requeueDeadWorkerTasks(teamName: string, deadWorkerNames
  */
 export declare function monitorTeamV2(teamName: string, cwd: string): Promise<TeamSnapshotV2 | null>;
 /**
- * Graceful team shutdown matching OMX semantics:
+ * Graceful team shutdown:
  * 1. Shutdown gate check (unless force)
  * 2. Send shutdown request to all workers via inbox
  * 3. Wait for ack or timeout

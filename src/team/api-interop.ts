@@ -149,6 +149,35 @@ function parseTeamWorkerEnv(raw: string | undefined): { teamName: string; worker
   return { teamName: match[1], workerName: match[2] };
 }
 
+function parseTeamWorkerContextFromEnv(env: NodeJS.ProcessEnv = process.env): { teamName: string; workerName: string } | null {
+  return parseTeamWorkerEnv(env.OMC_TEAM_WORKER) ?? parseTeamWorkerEnv(env.OMX_TEAM_WORKER);
+}
+
+function readTeamStateRootFromEnv(env: NodeJS.ProcessEnv = process.env): string | null {
+  const candidate = typeof env.OMC_TEAM_STATE_ROOT === 'string' && env.OMC_TEAM_STATE_ROOT.trim() !== ''
+    ? env.OMC_TEAM_STATE_ROOT.trim()
+    : (typeof env.OMX_TEAM_STATE_ROOT === 'string' && env.OMX_TEAM_STATE_ROOT.trim() !== ''
+      ? env.OMX_TEAM_STATE_ROOT.trim()
+      : '');
+  return candidate || null;
+}
+
+export function resolveTeamApiCliCommand(env: NodeJS.ProcessEnv = process.env): 'omc team api' | 'omx team api' {
+  const hasOmcContext = (
+    (typeof env.OMC_TEAM_WORKER === 'string' && env.OMC_TEAM_WORKER.trim() !== '')
+    || (typeof env.OMC_TEAM_STATE_ROOT === 'string' && env.OMC_TEAM_STATE_ROOT.trim() !== '')
+  );
+  if (hasOmcContext) return 'omc team api';
+
+  const hasOmxContext = (
+    (typeof env.OMX_TEAM_WORKER === 'string' && env.OMX_TEAM_WORKER.trim() !== '')
+    || (typeof env.OMX_TEAM_STATE_ROOT === 'string' && env.OMX_TEAM_STATE_ROOT.trim() !== '')
+  );
+  if (hasOmxContext) return 'omx team api';
+
+  return 'omc team api';
+}
+
 function readTeamStateRootFromFile(path: string): string | null {
   if (!existsSync(path)) return null;
   try {
@@ -191,7 +220,7 @@ function resolveTeamWorkingDirectoryFromMetadata(
 function resolveTeamWorkingDirectory(teamName: string, preferredCwd: string): string {
   const normalizedTeamName = String(teamName || '').trim();
   if (!normalizedTeamName) return preferredCwd;
-  const envTeamStateRoot = process.env.OMC_TEAM_STATE_ROOT;
+  const envTeamStateRoot = readTeamStateRootFromEnv();
   if (typeof envTeamStateRoot === 'string' && envTeamStateRoot.trim() !== '') {
     return stateRootToWorkingDirectory(envTeamStateRoot.trim());
   }
@@ -202,7 +231,7 @@ function resolveTeamWorkingDirectory(teamName: string, preferredCwd: string): st
     if (!seeds.includes(seed)) seeds.push(seed);
   }
 
-  const workerContext = parseTeamWorkerEnv(process.env.OMC_TEAM_WORKER);
+  const workerContext = parseTeamWorkerContextFromEnv();
   for (const seed of seeds) {
     let cursor = seed;
     while (cursor) {
@@ -228,13 +257,18 @@ export function resolveTeamApiOperation(name: string): TeamApiOperation | null {
   return TEAM_API_OPERATIONS.includes(normalized as TeamApiOperation) ? (normalized as TeamApiOperation) : null;
 }
 
-export function buildLegacyTeamDeprecationHint(legacyName: string, originalArgs?: Record<string, unknown>): string {
+export function buildLegacyTeamDeprecationHint(
+  legacyName: string,
+  originalArgs?: Record<string, unknown>,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
   const operation = resolveTeamApiOperation(legacyName);
   const payload = JSON.stringify(originalArgs ?? {});
+  const teamApiCli = resolveTeamApiCliCommand(env);
   if (!operation) {
-    return `Use CLI interop: omc team api <operation> --input '${payload}' --json`;
+    return `Use CLI interop: ${teamApiCli} <operation> --input '${payload}' --json`;
   }
-  return `Use CLI interop: omc team api ${operation} --input '${payload}' --json`;
+  return `Use CLI interop: ${teamApiCli} ${operation} --input '${payload}' --json`;
 }
 
 function validateCommonFields(args: Record<string, unknown>): void {

@@ -612,6 +612,16 @@ async function killTeamSession(sessionName2, workerPaneIds, leaderPaneId) {
     }
     return;
   }
+  if (process.env.OMC_TEAM_ALLOW_KILL_CURRENT_SESSION !== "1" && process.env.TMUX) {
+    try {
+      const current = await tmuxAsync(["display-message", "-p", "#S"]);
+      const currentSessionName = current.stdout.trim();
+      if (currentSessionName && currentSessionName === sessionName2) {
+        return;
+      }
+    } catch {
+    }
+  }
   try {
     await execFileAsync("tmux", ["kill-session", "-t", sessionName2]);
   } catch {
@@ -3070,8 +3080,9 @@ init_team_name();
 init_tmux_session();
 function isRuntimeV2Enabled(env = process.env) {
   const raw = env.OMC_RUNTIME_V2;
-  if (!raw) return false;
-  return ["1", "true", "yes"].includes(raw.trim().toLowerCase());
+  if (!raw) return true;
+  const normalized = raw.trim().toLowerCase();
+  return !["0", "false", "no", "off"].includes(normalized);
 }
 function sanitizeTeamName(name) {
   return name.replace(/[^a-z0-9-]/g, "").slice(0, 30);
@@ -3467,11 +3478,6 @@ async function shutdownTeamV2(teamName, cwd, options = {}) {
   const sanitized = sanitizeTeamName(teamName);
   const config = await readTeamConfig(sanitized, cwd);
   if (!config) {
-    try {
-      const { killTeamSession: killTeamSession2 } = await Promise.resolve().then(() => (init_tmux_session(), tmux_session_exports));
-      await killTeamSession2(`omc-team-${sanitized}`, [], void 0);
-    } catch {
-    }
     await cleanupTeamState(sanitized, cwd);
     return;
   }

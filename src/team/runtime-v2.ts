@@ -1,7 +1,9 @@
 /**
  * Event-driven team runtime v2 — replaces the polling watchdog from runtime.ts.
  *
- * Feature-flagged via OMC_RUNTIME_V2=1 environment variable.
+ * Runtime selection:
+ * - Default: v2 enabled
+ * - Opt-out: set OMC_RUNTIME_V2=0|false|no|off to force legacy v1
  * NO done.json polling. Completion is detected via:
  * - CLI API lifecycle transitions (claim-task, transition-task-status)
  * - Event-driven monitor snapshots
@@ -10,7 +12,7 @@
  * Preserves: sentinel gate, circuit breaker, failure sidecars.
  * Removes: done.json watchdog loop, sleep-based polling.
  *
- * Architecture matches OMX runtime.ts: startTeam, monitorTeam, shutdownTeam,
+ * Architecture mirrors runtime.ts: startTeam, monitorTeam, shutdownTeam,
  * assignTask, resumeTeam as discrete operations driven by the caller.
  */
 
@@ -71,8 +73,9 @@ import {
 
 export function isRuntimeV2Enabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env.OMC_RUNTIME_V2;
-  if (!raw) return false;
-  return ['1', 'true', 'yes'].includes(raw.trim().toLowerCase());
+  if (!raw) return true;
+  const normalized = raw.trim().toLowerCase();
+  return !['0', 'false', 'no', 'off'].includes(normalized);
 }
 
 // ---------------------------------------------------------------------------
@@ -797,7 +800,7 @@ export async function monitorTeamV2(
 // ---------------------------------------------------------------------------
 
 /**
- * Graceful team shutdown matching OMX semantics:
+ * Graceful team shutdown:
  * 1. Shutdown gate check (unless force)
  * 2. Send shutdown request to all workers via inbox
  * 3. Wait for ack or timeout
@@ -816,11 +819,8 @@ export async function shutdownTeamV2(
   const config = await readTeamConfig(sanitized, cwd);
 
   if (!config) {
-    // No config — try to kill tmux session and clean up
-    try {
-      const { killTeamSession } = await import('./tmux-session.js');
-      await killTeamSession(`omc-team-${sanitized}`, [], undefined);
-    } catch { /* best-effort session cleanup */ }
+    // No config available; only clean state. We intentionally avoid guessing
+    // a tmux session name here to prevent accidental self-session termination.
     await cleanupTeamState(sanitized, cwd);
     return;
   }

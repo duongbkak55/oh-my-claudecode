@@ -98,6 +98,28 @@ function parseTeamWorkerEnv(raw) {
         return null;
     return { teamName: match[1], workerName: match[2] };
 }
+function parseTeamWorkerContextFromEnv(env = process.env) {
+    return parseTeamWorkerEnv(env.OMC_TEAM_WORKER) ?? parseTeamWorkerEnv(env.OMX_TEAM_WORKER);
+}
+function readTeamStateRootFromEnv(env = process.env) {
+    const candidate = typeof env.OMC_TEAM_STATE_ROOT === 'string' && env.OMC_TEAM_STATE_ROOT.trim() !== ''
+        ? env.OMC_TEAM_STATE_ROOT.trim()
+        : (typeof env.OMX_TEAM_STATE_ROOT === 'string' && env.OMX_TEAM_STATE_ROOT.trim() !== ''
+            ? env.OMX_TEAM_STATE_ROOT.trim()
+            : '');
+    return candidate || null;
+}
+export function resolveTeamApiCliCommand(env = process.env) {
+    const hasOmcContext = ((typeof env.OMC_TEAM_WORKER === 'string' && env.OMC_TEAM_WORKER.trim() !== '')
+        || (typeof env.OMC_TEAM_STATE_ROOT === 'string' && env.OMC_TEAM_STATE_ROOT.trim() !== ''));
+    if (hasOmcContext)
+        return 'omc team api';
+    const hasOmxContext = ((typeof env.OMX_TEAM_WORKER === 'string' && env.OMX_TEAM_WORKER.trim() !== '')
+        || (typeof env.OMX_TEAM_STATE_ROOT === 'string' && env.OMX_TEAM_STATE_ROOT.trim() !== ''));
+    if (hasOmxContext)
+        return 'omx team api';
+    return 'omc team api';
+}
 function readTeamStateRootFromFile(path) {
     if (!existsSync(path))
         return null;
@@ -136,7 +158,7 @@ function resolveTeamWorkingDirectory(teamName, preferredCwd) {
     const normalizedTeamName = String(teamName || '').trim();
     if (!normalizedTeamName)
         return preferredCwd;
-    const envTeamStateRoot = process.env.OMC_TEAM_STATE_ROOT;
+    const envTeamStateRoot = readTeamStateRootFromEnv();
     if (typeof envTeamStateRoot === 'string' && envTeamStateRoot.trim() !== '') {
         return stateRootToWorkingDirectory(envTeamStateRoot.trim());
     }
@@ -147,7 +169,7 @@ function resolveTeamWorkingDirectory(teamName, preferredCwd) {
         if (!seeds.includes(seed))
             seeds.push(seed);
     }
-    const workerContext = parseTeamWorkerEnv(process.env.OMC_TEAM_WORKER);
+    const workerContext = parseTeamWorkerContextFromEnv();
     for (const seed of seeds) {
         let cursor = seed;
         while (cursor) {
@@ -171,13 +193,14 @@ export function resolveTeamApiOperation(name) {
     const normalized = normalizeTeamName(name);
     return TEAM_API_OPERATIONS.includes(normalized) ? normalized : null;
 }
-export function buildLegacyTeamDeprecationHint(legacyName, originalArgs) {
+export function buildLegacyTeamDeprecationHint(legacyName, originalArgs, env = process.env) {
     const operation = resolveTeamApiOperation(legacyName);
     const payload = JSON.stringify(originalArgs ?? {});
+    const teamApiCli = resolveTeamApiCliCommand(env);
     if (!operation) {
-        return `Use CLI interop: omc team api <operation> --input '${payload}' --json`;
+        return `Use CLI interop: ${teamApiCli} <operation> --input '${payload}' --json`;
     }
-    return `Use CLI interop: omc team api ${operation} --input '${payload}' --json`;
+    return `Use CLI interop: ${teamApiCli} ${operation} --input '${payload}' --json`;
 }
 function validateCommonFields(args) {
     const teamName = String(args.team_name || '').trim();

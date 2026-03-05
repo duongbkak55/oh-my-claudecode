@@ -86,6 +86,16 @@ async function killTeamSession(sessionName, workerPaneIds, leaderPaneId) {
     }
     return;
   }
+  if (process.env.OMC_TEAM_ALLOW_KILL_CURRENT_SESSION !== "1" && process.env.TMUX) {
+    try {
+      const current = await tmuxAsync(["display-message", "-p", "#S"]);
+      const currentSessionName = current.stdout.trim();
+      if (currentSessionName && currentSessionName === sessionName) {
+        return;
+      }
+    } catch {
+    }
+  }
   try {
     await execFileAsync("tmux", ["kill-session", "-t", sessionName]);
   } catch {

@@ -100,4 +100,88 @@ This is a summarized CLAUDE.md without markers.
     expect(`${result.stdout}\n${result.stderr}`).toContain('missing required OMC markers');
     expect(existsSync(join(fixture.projectRoot, '.claude', 'CLAUDE.md'))).toBe(false);
   });
+
+  it('adds a local git exclude block for .omc artifacts while preserving .omc/skills', () => {
+    const fixture = createPluginFixture(`<!-- OMC:START -->
+<!-- OMC:VERSION:9.9.9 -->
+
+# Canonical CLAUDE
+Use the real docs file.
+<!-- OMC:END -->
+`);
+
+    const gitInit = spawnSync('git', ['init'], {
+      cwd: fixture.projectRoot,
+      env: {
+        ...process.env,
+        HOME: fixture.homeRoot,
+      },
+      encoding: 'utf-8',
+    });
+    expect(gitInit.status).toBe(0);
+
+    const result = spawnSync('bash', [fixture.scriptPath, 'local'], {
+      cwd: fixture.projectRoot,
+      env: {
+        ...process.env,
+        HOME: fixture.homeRoot,
+      },
+      encoding: 'utf-8',
+    });
+
+    expect(result.status).toBe(0);
+
+    const excludePath = join(fixture.projectRoot, '.git', 'info', 'exclude');
+    expect(existsSync(excludePath)).toBe(true);
+
+    const excludeContents = readFileSync(excludePath, 'utf-8');
+    expect(excludeContents).toContain('# BEGIN OMC local artifacts');
+    expect(excludeContents).toContain('.omc/*');
+    expect(excludeContents).toContain('!.omc/skills/');
+    expect(excludeContents).toContain('!.omc/skills/**');
+    expect(excludeContents).toContain('# END OMC local artifacts');
+  });
+
+  it('does not duplicate the local git exclude block on repeated local setup runs', () => {
+    const fixture = createPluginFixture(`<!-- OMC:START -->
+<!-- OMC:VERSION:9.9.9 -->
+
+# Canonical CLAUDE
+Use the real docs file.
+<!-- OMC:END -->
+`);
+
+    const gitInit = spawnSync('git', ['init'], {
+      cwd: fixture.projectRoot,
+      env: {
+        ...process.env,
+        HOME: fixture.homeRoot,
+      },
+      encoding: 'utf-8',
+    });
+    expect(gitInit.status).toBe(0);
+
+    const firstRun = spawnSync('bash', [fixture.scriptPath, 'local'], {
+      cwd: fixture.projectRoot,
+      env: {
+        ...process.env,
+        HOME: fixture.homeRoot,
+      },
+      encoding: 'utf-8',
+    });
+    expect(firstRun.status).toBe(0);
+
+    const secondRun = spawnSync('bash', [fixture.scriptPath, 'local'], {
+      cwd: fixture.projectRoot,
+      env: {
+        ...process.env,
+        HOME: fixture.homeRoot,
+      },
+      encoding: 'utf-8',
+    });
+    expect(secondRun.status).toBe(0);
+
+    const excludeContents = readFileSync(join(fixture.projectRoot, '.git', 'info', 'exclude'), 'utf-8');
+    expect(excludeContents.match(/# BEGIN OMC local artifacts/g)).toHaveLength(1);
+  });
 });

@@ -13,6 +13,38 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CANONICAL_CLAUDE_MD="${SCRIPT_PLUGIN_ROOT}/docs/CLAUDE.md"
 
+ensure_local_omc_git_exclude() {
+  local exclude_path
+
+  if ! exclude_path=$(git rev-parse --git-path info/exclude 2>/dev/null); then
+    echo "Skipped OMC git exclude setup (not a git repository)"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$exclude_path")"
+
+  local block_start="# BEGIN OMC local artifacts"
+
+  if [ -f "$exclude_path" ] && grep -Fq "$block_start" "$exclude_path"; then
+    echo "OMC git exclude already configured"
+    return 0
+  fi
+
+  if [ -f "$exclude_path" ] && [ -s "$exclude_path" ]; then
+    printf '\n' >> "$exclude_path"
+  fi
+
+  cat >> "$exclude_path" <<'EOF'
+# BEGIN OMC local artifacts
+.omc/*
+!.omc/skills/
+!.omc/skills/**
+# END OMC local artifacts
+EOF
+
+  echo "Configured git exclude for local .omc artifacts (preserving .omc/skills/)"
+}
+
 # Determine target path
 if [ "$MODE" = "local" ]; then
   mkdir -p .claude
@@ -143,6 +175,10 @@ fi
 if ! grep -q '<!-- OMC:START -->' "$TARGET_PATH" || ! grep -q '<!-- OMC:END -->' "$TARGET_PATH"; then
   echo "ERROR: Installed CLAUDE.md is missing required OMC markers: $TARGET_PATH" >&2
   exit 1
+fi
+
+if [ "$MODE" = "local" ]; then
+  ensure_local_omc_git_exclude
 fi
 
 # Extract new version and report

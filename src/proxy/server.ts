@@ -19,6 +19,7 @@ import {
 } from "./dlp.js";
 import { InProcessTokenVault } from "./vault.js";
 import { Dictionary, type DictionaryEntry } from "./dictionary.js";
+import { SqlLane } from "./sql-lane.js";
 import { scanRequestForBannedTools, validateUpstreamUrl } from "./allowlist.js";
 import { auditEvent, summarizeMatches } from "./audit.js";
 import {
@@ -169,6 +170,13 @@ export async function startProxy(opts: StartProxyOptions): Promise<StartedProxy>
   }
   const dictionary =
     dictionaryEntries.length > 0 ? new Dictionary(dictionaryEntries) : undefined;
+  const sqlLane = config.sqlDlp.enabled
+    ? new SqlLane({
+        enabled: true,
+        includeColumns: config.sqlDlp.includeColumns,
+        dialect: config.sqlDlp.dialect,
+      })
+    : undefined;
   const convHeaderLower = config.conversation.headerName.toLowerCase();
   const CONV_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -351,6 +359,7 @@ export async function startProxy(opts: StartProxyOptions): Promise<StartedProxy>
         const dlp = redactAnthropicRequest(parsed, patterns, {
           vault: vaultCtx,
           dictionary,
+          sqlLane,
         });
         if (dlp.blocked) {
           metrics.blocked_total += 1;

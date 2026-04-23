@@ -9,6 +9,7 @@ import type { CompiledPattern } from "./config.js";
 import type { TokenVault } from "./vault.js";
 import { TOKEN_REGEX } from "./vault.js";
 import type { Dictionary, DictionaryMatch } from "./dictionary.js";
+import type { SqlLane } from "./sql-lane.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const safeRegex: (re: RegExp | string) => boolean = safeRegexDefault as any;
@@ -101,6 +102,7 @@ export interface ApplyPolicyResult {
 export interface ApplyPolicyOptions {
   vault?: VaultContext;
   dictionary?: Dictionary;
+  sqlLane?: SqlLane;
 }
 
 interface ActionableMatch {
@@ -117,26 +119,36 @@ export function applyPolicy(
   patterns: CompiledPattern[],
   opts: ApplyPolicyOptions = {},
 ): ApplyPolicyResult {
-  const regexMatches = scan(text, patterns);
+  // Pass 0: SQL lane (structural rewrite, may change text length). Runs first
+  // so regex/dict offsets remain valid on the already-SQL-masked output.
+  let workText = text;
+  const sqlMatches: DlpMatch[] = [];
+  if (opts.sqlLane && opts.vault) {
+    const r = opts.sqlLane.apply(text, opts.vault);
+    workText = r.output;
+    for (const m of r.matches) sqlMatches.push(m);
+  }
+  const regexMatches = scan(workText, patterns);
   const dictMatches: DictionaryMatch[] = opts.dictionary
-    ? opts.dictionary.scan(text)
+    ? opts.dictionary.scan(workText)
     : [];
   const hasBlock =
     regexMatches.some((m) => m.policy === "block") ||
     dictMatches.some((m) => m.policy === "block");
-  // Lift dictionary hits into DlpMatch[] for reporting uniformly.
-  const allMatches: DlpMatch[] = regexMatches.slice();
+  // Lift dictionary hits into DlpMatch[] for reporting uniformly. SQL-lane
+  // matches are pre-populated (structural rewrites already applied upstream).
+  const allMatches: DlpMatch[] = [...sqlMatches, ...regexMatches];
   for (const d of dictMatches) {
     allMatches.push({
       patternName: `dict:${d.classifier}`,
       policy: d.policy,
       start: d.start,
       end: d.end,
-      sample: maskSample(text.slice(d.start, d.end)),
+      sample: maskSample(workText.slice(d.start, d.end)),
     });
   }
   if (hasBlock) {
-    return { output: text, matches: allMatches, blocked: true };
+    return { output: workText, matches: allMatches, blocked: true };
   }
   // Build a merged, non-overlapping action list preferring earlier start;
   // ties broken by longest match so a tokenized dict term beats a partial
@@ -150,7 +162,7 @@ export function applyPolicy(
       policy: m.policy,
       patternName: m.patternName,
       classifier: m.patternName,
-      original: text.slice(m.start, m.end),
+      original: workText.slice(m.start, m.end),
     });
   }
   for (const d of dictMatches) {
@@ -161,11 +173,11 @@ export function applyPolicy(
       policy: d.policy,
       patternName: `dict:${d.classifier}`,
       classifier: d.classifier,
-      original: text.slice(d.start, d.end),
+      original: workText.slice(d.start, d.end),
     });
   }
   if (actions.length === 0) {
-    return { output: text, matches: allMatches, blocked: false };
+    return { output: workText, matches: allMatches, blocked: false };
   }
   actions.sort((a, b) => {
     if (a.start !== b.start) return a.start - b.start;
@@ -175,7 +187,7 @@ export function applyPolicy(
   let cursor = 0;
   for (const m of actions) {
     if (m.start < cursor) continue;
-    out += text.slice(cursor, m.start);
+    out += workText.slice(cursor, m.start);
     if (m.policy === "tokenize" && opts.vault) {
       const token = opts.vault.vault.issue(
         opts.vault.convId,
@@ -189,7 +201,7 @@ export function applyPolicy(
     }
     cursor = m.end;
   }
-  out += text.slice(cursor);
+  out += workText.slice(cursor);
   return { output: out, matches: allMatches, blocked: false };
 }
 

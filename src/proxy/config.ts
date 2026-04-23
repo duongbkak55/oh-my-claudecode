@@ -81,6 +81,13 @@ export const ProxyConfigSchema = z.object({
       headerName: z.string().min(1).default("X-OMC-Conversation-Id"),
     })
     .default({ headerName: "X-OMC-Conversation-Id" }),
+  sqlDlp: z
+    .object({
+      enabled: z.boolean().default(false),
+      includeColumns: z.boolean().default(false),
+      dialect: z.enum(["mysql", "postgres", "bigquery", "sqlite"]).default("mysql"),
+    })
+    .default({ enabled: false, includeColumns: false, dialect: "mysql" }),
 });
 
 export type DlpPattern = z.infer<typeof DlpPatternSchema>;
@@ -240,6 +247,21 @@ function envOverrides(): Partial<ProxyConfig> {
     agentLoop.enabled = process.env.OMC_PROXY_AGENT_LOOP === "1";
   }
   if (Object.keys(agentLoop).length > 0) out.agentLoop = agentLoop;
+
+  const sqlDlp: Record<string, unknown> = {};
+  if (process.env.OMC_PROXY_SQL_DLP !== undefined) {
+    sqlDlp.enabled = process.env.OMC_PROXY_SQL_DLP === "1";
+  }
+  if (process.env.OMC_PROXY_SQL_DLP_COLUMNS !== undefined) {
+    sqlDlp.includeColumns = process.env.OMC_PROXY_SQL_DLP_COLUMNS === "1";
+  }
+  if (process.env.OMC_PROXY_SQL_DLP_DIALECT) {
+    const d = process.env.OMC_PROXY_SQL_DLP_DIALECT;
+    if (d === "mysql" || d === "postgres" || d === "bigquery" || d === "sqlite") {
+      sqlDlp.dialect = d;
+    }
+  }
+  if (Object.keys(sqlDlp).length > 0) out.sqlDlp = sqlDlp;
 
   return out as Partial<ProxyConfig>;
 }

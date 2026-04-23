@@ -319,6 +319,238 @@ describe("proxy server integration", () => {
     });
   });
 
+  describe("tokenize + detokenize round-trip", () => {
+    function tokenizingConfig(auditDir: string): ProxyConfig {
+      const base = baseConfig(auditDir);
+      return {
+        ...base,
+        dlp: {
+          patterns: [
+            {
+              name: "email",
+              regex: "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}",
+              policy: "tokenize",
+            },
+          ],
+          customDenyTerms: [],
+        },
+        dictionary: {
+          entries: [
+            {
+              term: "Vietcombank",
+              classifier: "PARTNER_NAME",
+              policy: "tokenize",
+            },
+          ],
+        },
+      };
+    }
+
+    it("email round-trip: client -> token to upstream -> original back to client", async () => {
+      let upstreamSawToken: string | null = null;
+      upstream = await createMockUpstream((req, res) => {
+        let data = "";
+        req.on("data", (c: Buffer) => (data += c.toString("utf-8")));
+        req.on("end", () => {
+          const parsed = JSON.parse(data) as {
+            messages: Array<{ content: string }>;
+          };
+          const content = parsed.messages[0]!.content;
+          const m = content.match(/EMAIL_\d{2,3}/);
+          upstreamSawToken = m ? m[0] : null;
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              id: "msg_r1",
+              role: "assistant",
+              model: "claude-test",
+              content: [
+                {
+                  type: "text",
+                  text: `ok, I'll contact ${upstreamSawToken ?? ""} shortly`,
+                },
+              ],
+            }),
+          );
+        });
+      });
+      proxy = await startProxy({
+        config: tokenizingConfig(auditDir),
+        upstreamBaseUrlOverride: upstream.url,
+      });
+      const r = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...AUTH,
+          "x-omc-conversation-id": "conv-round-trip",
+        },
+        body: JSON.stringify({
+          model: "claude-test",
+          messages: [
+            { role: "user", content: "please email alice@example.com" },
+          ],
+        }),
+      });
+      expect(r.status).toBe(200);
+      expect(upstreamSawToken).not.toBeNull();
+      expect(upstreamSawToken).toMatch(/^EMAIL_\d{2,3}$/);
+      const body = (await r.json()) as {
+        content: Array<{ text: string }>;
+      };
+      expect(body.content[0]!.text).toContain("alice@example.com");
+      expect(body.content[0]!.text).not.toContain("EMAIL_0");
+    });
+
+    it("dictionary hit Vietcombank is tokenized on request and restored on response", async () => {
+      let upstreamPayload = "";
+      upstream = await createMockUpstream((req, res) => {
+        let data = "";
+        req.on("data", (c: Buffer) => (data += c.toString("utf-8")));
+        req.on("end", () => {
+          upstreamPayload = data;
+          // echo the Vietcombank token back
+          const parsed = JSON.parse(data) as {
+            messages: Array<{ content: string }>;
+          };
+          const content = parsed.messages[0]!.content;
+          const m = content.match(/PARTNER_NAME_\d{2,3}/);
+          const echo = m ? m[0] : "NONE";
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              id: "msg_v1",
+              role: "assistant",
+              model: "claude-test",
+              content: [
+                { type: "text", text: `Working with ${echo} folks.` },
+              ],
+            }),
+          );
+        });
+      });
+      proxy = await startProxy({
+        config: tokenizingConfig(auditDir),
+        upstreamBaseUrlOverride: upstream.url,
+      });
+      const r = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...AUTH,
+          "x-omc-conversation-id": "conv-dict",
+        },
+        body: JSON.stringify({
+          model: "claude-test",
+          messages: [
+            {
+              role: "user",
+              content: "Integrate with Vietcombank as soon as possible.",
+            },
+          ],
+        }),
+      });
+      expect(r.status).toBe(200);
+      expect(upstreamPayload).not.toContain("Vietcombank");
+      expect(upstreamPayload).toMatch(/PARTNER_NAME_\d{2,3}/);
+      const body = (await r.json()) as {
+        content: Array<{ text: string }>;
+      };
+      expect(body.content[0]!.text).toContain("Vietcombank");
+      expect(body.content[0]!.text).not.toContain("PARTNER_NAME_");
+    });
+
+    it("X-OMC-Conversation-Id header groups tokens across requests", async () => {
+      const sawTokens: string[] = [];
+      upstream = await createMockUpstream((req, res) => {
+        let data = "";
+        req.on("data", (c: Buffer) => (data += c.toString("utf-8")));
+        req.on("end", () => {
+          const m = data.match(/EMAIL_\d{2,3}/g);
+          if (m) for (const t of m) sawTokens.push(t);
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              id: "msg_c",
+              role: "assistant",
+              model: "claude-test",
+              content: [{ type: "text", text: "ok" }],
+            }),
+          );
+        });
+      });
+      proxy = await startProxy({
+        config: tokenizingConfig(auditDir),
+        upstreamBaseUrlOverride: upstream.url,
+      });
+      const hdr = {
+        "content-type": "application/json",
+        ...AUTH,
+        "x-omc-conversation-id": "conv-shared",
+      };
+      await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+        method: "POST",
+        headers: hdr,
+        body: JSON.stringify({
+          model: "claude-test",
+          messages: [{ role: "user", content: "mail alice@example.com" }],
+        }),
+      });
+      await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+        method: "POST",
+        headers: hdr,
+        body: JSON.stringify({
+          model: "claude-test",
+          messages: [{ role: "user", content: "again alice@example.com" }],
+        }),
+      });
+      expect(sawTokens.length).toBeGreaterThanOrEqual(2);
+      // Same value in same conversation must issue the same token.
+      expect(sawTokens[0]).toBe(sawTokens[1]);
+    });
+
+    it("system prompt contains the DLP preservation instruction", async () => {
+      let upstreamSystem: unknown = undefined;
+      upstream = await createMockUpstream((req, res) => {
+        let data = "";
+        req.on("data", (c: Buffer) => (data += c.toString("utf-8")));
+        req.on("end", () => {
+          const parsed = JSON.parse(data) as { system?: unknown };
+          upstreamSystem = parsed.system;
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              id: "msg_s",
+              role: "assistant",
+              model: "claude-test",
+              content: [{ type: "text", text: "k" }],
+            }),
+          );
+        });
+      });
+      proxy = await startProxy({
+        config: tokenizingConfig(auditDir),
+        upstreamBaseUrlOverride: upstream.url,
+      });
+      await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...AUTH },
+        body: JSON.stringify({
+          model: "claude-test",
+          system: "You are helpful.",
+          messages: [
+            { role: "user", content: "mail alice@example.com now" },
+          ],
+        }),
+      });
+      const s =
+        typeof upstreamSystem === "string"
+          ? upstreamSystem
+          : JSON.stringify(upstreamSystem);
+      expect(s).toContain("[OMC-DLP]");
+    });
+  });
+
   it("does NOT leak an sk-ant secret split across SSE frames", async () => {
     upstream = await createMockUpstream((_req, res) => {
       res.writeHead(200, {

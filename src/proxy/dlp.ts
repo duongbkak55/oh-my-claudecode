@@ -6,13 +6,16 @@
 
 import safeRegexDefault from "safe-regex";
 import type { CompiledPattern } from "./config.js";
+import type { TokenVault } from "./vault.js";
+import { TOKEN_REGEX } from "./vault.js";
+import type { Dictionary, DictionaryMatch } from "./dictionary.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const safeRegex: (re: RegExp | string) => boolean = safeRegexDefault as any;
 
 export interface DlpMatch {
   patternName: string;
-  policy: "block" | "redact";
+  policy: "block" | "redact" | "tokenize";
   start: number;
   end: number;
   sample: string;
@@ -21,8 +24,13 @@ export interface DlpMatch {
 export interface DlpRawPattern {
   name: string;
   regex: string;
-  policy: "block" | "redact";
+  policy: "block" | "redact" | "tokenize";
   replacement?: string;
+}
+
+export interface VaultContext {
+  convId: string;
+  vault: TokenVault;
 }
 
 export function compilePatterns(raw: DlpRawPattern[]): CompiledPattern[] {
@@ -90,33 +98,99 @@ export interface ApplyPolicyResult {
   blocked: boolean;
 }
 
+export interface ApplyPolicyOptions {
+  vault?: VaultContext;
+  dictionary?: Dictionary;
+}
+
+interface ActionableMatch {
+  start: number;
+  end: number;
+  policy: "redact" | "tokenize";
+  patternName: string;
+  classifier: string;
+  original: string;
+}
+
 export function applyPolicy(
   text: string,
   patterns: CompiledPattern[],
+  opts: ApplyPolicyOptions = {},
 ): ApplyPolicyResult {
-  const matches = scan(text, patterns);
-  const hasBlock = matches.some((m) => m.policy === "block");
+  const regexMatches = scan(text, patterns);
+  const dictMatches: DictionaryMatch[] = opts.dictionary
+    ? opts.dictionary.scan(text)
+    : [];
+  const hasBlock =
+    regexMatches.some((m) => m.policy === "block") ||
+    dictMatches.some((m) => m.policy === "block");
+  // Lift dictionary hits into DlpMatch[] for reporting uniformly.
+  const allMatches: DlpMatch[] = regexMatches.slice();
+  for (const d of dictMatches) {
+    allMatches.push({
+      patternName: `dict:${d.classifier}`,
+      policy: d.policy,
+      start: d.start,
+      end: d.end,
+      sample: maskSample(text.slice(d.start, d.end)),
+    });
+  }
   if (hasBlock) {
-    return { output: text, matches, blocked: true };
+    return { output: text, matches: allMatches, blocked: true };
   }
-  const redacts = matches
-    .filter((m) => m.policy === "redact")
-    .sort((a, b) => a.start - b.start);
-  if (redacts.length === 0) {
-    return { output: text, matches, blocked: false };
+  // Build a merged, non-overlapping action list preferring earlier start;
+  // ties broken by longest match so a tokenized dict term beats a partial
+  // regex hit at the same start.
+  const actions: ActionableMatch[] = [];
+  for (const m of regexMatches) {
+    if (m.policy === "block") continue;
+    actions.push({
+      start: m.start,
+      end: m.end,
+      policy: m.policy,
+      patternName: m.patternName,
+      classifier: m.patternName,
+      original: text.slice(m.start, m.end),
+    });
   }
-  // Walk in order, dropping overlaps.
+  for (const d of dictMatches) {
+    if (d.policy === "block") continue;
+    actions.push({
+      start: d.start,
+      end: d.end,
+      policy: d.policy,
+      patternName: `dict:${d.classifier}`,
+      classifier: d.classifier,
+      original: text.slice(d.start, d.end),
+    });
+  }
+  if (actions.length === 0) {
+    return { output: text, matches: allMatches, blocked: false };
+  }
+  actions.sort((a, b) => {
+    if (a.start !== b.start) return a.start - b.start;
+    return b.end - a.end;
+  });
   let out = "";
   let cursor = 0;
-  for (const m of redacts) {
+  for (const m of actions) {
     if (m.start < cursor) continue;
-    const replacement = findReplacement(patterns, m.patternName);
     out += text.slice(cursor, m.start);
-    out += replacement ?? `[REDACTED:${m.patternName}]`;
+    if (m.policy === "tokenize" && opts.vault) {
+      const token = opts.vault.vault.issue(
+        opts.vault.convId,
+        m.classifier,
+        m.original,
+      );
+      out += token;
+    } else {
+      const replacement = findReplacement(patterns, m.patternName);
+      out += replacement ?? `[REDACTED:${m.patternName}]`;
+    }
     cursor = m.end;
   }
   out += text.slice(cursor);
-  return { output: out, matches, blocked: false };
+  return { output: out, matches: allMatches, blocked: false };
 }
 
 function findReplacement(
@@ -164,8 +238,9 @@ function redactString(
   patterns: CompiledPattern[],
   matches: DlpMatch[],
   reasons: Set<string>,
+  opts: ApplyPolicyOptions = {},
 ): { text: string; blocked: boolean } {
-  const r = applyPolicy(s, patterns);
+  const r = applyPolicy(s, patterns, opts);
   for (const m of r.matches) {
     matches.push(m);
     if (m.policy === "block") reasons.add(m.patternName);
@@ -200,6 +275,7 @@ export function walkAndRedact(
   patterns: CompiledPattern[],
   matches: DlpMatch[],
   reasons: Set<string>,
+  opts: ApplyPolicyOptions = {},
 ): { value: unknown; blocked: boolean } {
   let blocked = false;
   if (value === null || value === undefined) {
@@ -207,7 +283,7 @@ export function walkAndRedact(
   }
   if (Array.isArray(value)) {
     for (let i = 0; i < value.length; i++) {
-      const r = walkAndRedact(value[i], patterns, matches, reasons);
+      const r = walkAndRedact(value[i], patterns, matches, reasons, opts);
       value[i] = r.value;
       blocked = blocked || r.blocked;
     }
@@ -218,11 +294,11 @@ export function walkAndRedact(
     for (const [k, v] of Object.entries(obj)) {
       if (typeof v === "string") {
         if (STRUCTURAL_KEYS.has(k)) continue;
-        const r = redactString(v, patterns, matches, reasons);
+        const r = redactString(v, patterns, matches, reasons, opts);
         obj[k] = r.text;
         blocked = blocked || r.blocked;
       } else if (v !== null && typeof v === "object") {
-        const r = walkAndRedact(v, patterns, matches, reasons);
+        const r = walkAndRedact(v, patterns, matches, reasons, opts);
         obj[k] = r.value;
         blocked = blocked || r.blocked;
       }
@@ -232,9 +308,34 @@ export function walkAndRedact(
   return { value, blocked };
 }
 
+const DLP_INSTRUCTION =
+  "[OMC-DLP]: Preserve identifier tokens of the form EMAIL_NN, PHONE_NN, " +
+  "PERSON_NN, PKG_NN, CN_NN, CUSTOMER_NN, HOST_NN, TICKET_NN verbatim. " +
+  "Do not rename, paraphrase, or correct typos in these tokens.";
+
+function injectDlpInstruction(body: AnthropicRequestBody): void {
+  if (typeof body.system === "string") {
+    if (body.system.includes("[OMC-DLP]")) return;
+    body.system = body.system.length > 0
+      ? `${DLP_INSTRUCTION}\n\n${body.system}`
+      : DLP_INSTRUCTION;
+    return;
+  }
+  if (Array.isArray(body.system)) {
+    const already = body.system.some(
+      (b) => b && typeof b.text === "string" && b.text.includes("[OMC-DLP]"),
+    );
+    if (already) return;
+    body.system.unshift({ type: "text", text: DLP_INSTRUCTION });
+    return;
+  }
+  body.system = DLP_INSTRUCTION;
+}
+
 export function redactAnthropicRequest(
   body: AnthropicRequestBody,
   patterns: CompiledPattern[],
+  opts: ApplyPolicyOptions = {},
 ): RedactRequestResult {
   const matches: DlpMatch[] = [];
   const reasons = new Set<string>();
@@ -243,14 +344,27 @@ export function redactAnthropicRequest(
   // deep clone so we don't mutate the caller's object
   const clone = JSON.parse(JSON.stringify(body)) as AnthropicRequestBody;
 
+  // Determine whether any tokenize policy could fire. If yes, and a vault is
+  // supplied, pre-inject the DLP instruction into `system` BEFORE walking so
+  // it survives the scan and the model sees it.
+  const mightTokenize =
+    !!opts.vault &&
+    (patterns.some((p) => p.policy === "tokenize") ||
+      // dictionary entries with tokenize policy — cheap check: always inject
+      // when a dictionary is present; injection is idempotent.
+      !!opts.dictionary);
+  if (mightTokenize) {
+    injectDlpInstruction(clone);
+  }
+
   if (typeof clone.system === "string") {
-    const r = redactString(clone.system, patterns, matches, reasons);
+    const r = redactString(clone.system, patterns, matches, reasons, opts);
     clone.system = r.text;
     blocked = blocked || r.blocked;
   } else if (Array.isArray(clone.system)) {
     for (const block of clone.system) {
       if (block && typeof block.text === "string") {
-        const r = redactString(block.text, patterns, matches, reasons);
+        const r = redactString(block.text, patterns, matches, reasons, opts);
         block.text = r.text;
         blocked = blocked || r.blocked;
       }
@@ -260,7 +374,7 @@ export function redactAnthropicRequest(
   if (Array.isArray(clone.messages)) {
     for (const msg of clone.messages) {
       if (typeof msg.content === "string") {
-        const r = redactString(msg.content, patterns, matches, reasons);
+        const r = redactString(msg.content, patterns, matches, reasons, opts);
         msg.content = r.text;
         blocked = blocked || r.blocked;
       } else if (Array.isArray(msg.content)) {
@@ -268,18 +382,18 @@ export function redactAnthropicRequest(
           if (!block || typeof block !== "object") continue;
           // top-level text on a block
           if (typeof block.text === "string") {
-            const r = redactString(block.text, patterns, matches, reasons);
+            const r = redactString(block.text, patterns, matches, reasons, opts);
             block.text = r.text;
             blocked = blocked || r.blocked;
           }
           // tool_result (and similar) can have content: string | array
           const innerContent = (block as { content?: unknown }).content;
           if (typeof innerContent === "string") {
-            const r = redactString(innerContent, patterns, matches, reasons);
+            const r = redactString(innerContent, patterns, matches, reasons, opts);
             (block as { content?: unknown }).content = r.text;
             blocked = blocked || r.blocked;
           } else if (Array.isArray(innerContent)) {
-            const wr = walkAndRedact(innerContent, patterns, matches, reasons);
+            const wr = walkAndRedact(innerContent, patterns, matches, reasons, opts);
             (block as { content?: unknown }).content = wr.value;
             blocked = blocked || wr.blocked;
           }
@@ -293,13 +407,13 @@ export function redactAnthropicRequest(
       if (!tool || typeof tool !== "object") continue;
       const t = tool as Record<string, unknown>;
       if (typeof t.description === "string") {
-        const r = redactString(t.description, patterns, matches, reasons);
+        const r = redactString(t.description, patterns, matches, reasons, opts);
         t.description = r.text;
         blocked = blocked || r.blocked;
       }
       const schema = t.input_schema;
       if (schema && typeof schema === "object") {
-        const wr = walkAndRedact(schema, patterns, matches, reasons);
+        const wr = walkAndRedact(schema, patterns, matches, reasons, opts);
         t.input_schema = wr.value;
         blocked = blocked || wr.blocked;
       }
@@ -314,6 +428,51 @@ export function redactAnthropicRequest(
   };
 }
 
+/**
+ * Walk a response-shaped JSON value and replace all occurrences of vault tokens
+ * with the original secret. Mutates objects/arrays in-place. Unknown tokens
+ * (not in the vault for this convId) pass through unchanged.
+ */
+export function detokenize(
+  text: string,
+  convId: string,
+  vault: TokenVault,
+): string {
+  if (!text) return text;
+  TOKEN_REGEX.lastIndex = 0;
+  return text.replace(TOKEN_REGEX, (tok) => {
+    const v = vault.lookup(convId, tok);
+    return v ?? tok;
+  });
+}
+
+export function detokenizeValue(
+  value: unknown,
+  convId: string,
+  vault: TokenVault,
+): unknown {
+  if (value === null || value === undefined) return value;
+  if (typeof value === "string") return detokenize(value, convId, vault);
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      value[i] = detokenizeValue(value[i], convId, vault);
+    }
+    return value;
+  }
+  if (typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof v === "string") {
+        obj[k] = detokenize(v, convId, vault);
+      } else if (v !== null && typeof v === "object") {
+        obj[k] = detokenizeValue(v, convId, vault);
+      }
+    }
+    return obj;
+  }
+  return value;
+}
+
 // --- SSE rolling redactor --------------------------------------------------
 
 /**
@@ -326,7 +485,7 @@ export function redactAnthropicRequest(
  * On `content_block_stop` the tail is flushed through a final scan.
  * On `message_stop` or explicit block hit, all buffers are cleared.
  */
-const HOLD_BACK = 256;
+const HOLD_BACK = 512;
 
 interface BlockBuffer {
   buffer: string;
@@ -343,12 +502,14 @@ export interface SseEmitResult {
 
 export class SseRedactor {
   private readonly patterns: CompiledPattern[];
+  private readonly opts: ApplyPolicyOptions;
   private readonly blocks: Map<number, BlockBuffer> = new Map();
   private carry: string = "";
   private streamBlocked = false;
 
-  constructor(patterns: CompiledPattern[]) {
+  constructor(patterns: CompiledPattern[], opts: ApplyPolicyOptions = {}) {
     this.patterns = patterns;
+    this.opts = opts;
   }
 
   get blocked(): boolean {
@@ -438,7 +599,7 @@ export class SseRedactor {
     for (const [index, buf] of this.blocks) {
       if (buf.emittedLen >= buf.buffer.length) continue;
       const full = buf.buffer;
-      const r = applyPolicy(full, this.patterns);
+      const r = applyPolicy(full, this.patterns, this.opts);
       for (const m of r.matches) matches.push(m);
       if (r.blocked) {
         this.streamBlocked = true;
@@ -456,7 +617,11 @@ export class SseRedactor {
         };
       }
       // Emit the tail as a final delta frame.
-      const tailScan = applyPolicy(full.slice(buf.emittedLen), this.patterns);
+      const tailScan = applyPolicy(
+        full.slice(buf.emittedLen),
+        this.patterns,
+        this.opts,
+      );
       const deltaType =
         buf.type === "thinking"
           ? "thinking_delta"
@@ -544,7 +709,7 @@ export class SseRedactor {
         const safeEnd = Math.max(0, buf.buffer.length - HOLD_BACK);
         const safePrefix = buf.buffer.slice(buf.emittedLen, safeEnd);
         if (safePrefix.length > 0) {
-          const r = applyPolicy(safePrefix, this.patterns);
+          const r = applyPolicy(safePrefix, this.patterns, this.opts);
           for (const m of r.matches) matches.push(m);
           if (r.blocked) {
             for (const m of r.matches.filter((x) => x.policy === "block"))
@@ -609,7 +774,7 @@ export class SseRedactor {
         // buffer (scan on the whole buffer up to safeEnd, then take the
         // incremental output beyond emittedLen).
         const fullScanInput = buf.buffer.slice(0, safeEnd);
-        const r = applyPolicy(fullScanInput, this.patterns);
+        const r = applyPolicy(fullScanInput, this.patterns, this.opts);
         for (const m of r.matches) matches.push(m);
         if (r.blocked) {
           for (const m of r.matches.filter((x) => x.policy === "block"))
@@ -627,7 +792,7 @@ export class SseRedactor {
         // non-blocked content, re-redact just the new delta (which is the
         // safe slice). That's a local scan; secrets only trigger if the
         // whole accumulator was blocked above, which we already handled.
-        const localScan = applyPolicy(safeSlice, this.patterns);
+        const localScan = applyPolicy(safeSlice, this.patterns, this.opts);
         (delta as Record<string, string>)[field] = localScan.output;
         buf.emittedLen += safeSlice.length;
         outLines.push(`data: ${JSON.stringify(parsed)}`);
@@ -639,7 +804,7 @@ export class SseRedactor {
         if (buf && buf.emittedLen < buf.buffer.length) {
           const tail = buf.buffer.slice(buf.emittedLen);
           // Final scan on the FULL buffer catches secrets that span the tail.
-          const r = applyPolicy(buf.buffer, this.patterns);
+          const r = applyPolicy(buf.buffer, this.patterns, this.opts);
           for (const m of r.matches) matches.push(m);
           if (r.blocked) {
             for (const m of r.matches.filter((x) => x.policy === "block"))
@@ -652,7 +817,7 @@ export class SseRedactor {
           }
           // Emit the tail as a final content_block_delta before the stop.
           // We redact locally (safe because full scan didn't block).
-          const tailScan = applyPolicy(tail, this.patterns);
+          const tailScan = applyPolicy(tail, this.patterns, this.opts);
           const deltaType =
             buf.type === "thinking"
               ? "thinking_delta"
@@ -697,6 +862,211 @@ export class SseRedactor {
  * Applies to `delta.text` on content_block_delta events. Anything that fails
  * to parse is forwarded unchanged to avoid breaking the stream.
  */
+/**
+ * Inverse of SseRedactor. Buffers per-content-block text until HOLD_BACK bytes
+ * have been seen, then scans for vault tokens and replaces them with their
+ * original value. Handles tokens split across SSE delta frames.
+ *
+ * Unknown tokens (not in the vault) pass through unchanged — they may be
+ * content the model emitted that just happens to look like our token shape.
+ */
+interface DetokBuffer {
+  buffer: string;
+  type: "text" | "thinking" | "partial_json";
+  emittedLen: number;
+}
+
+export interface SseDetokenizeResult {
+  emit: string;
+}
+
+export class SseDetokenizer {
+  private readonly convId: string;
+  private readonly vault: TokenVault;
+  private readonly blocks: Map<number, DetokBuffer> = new Map();
+  private carry: string = "";
+
+  constructor(convId: string, vault: TokenVault) {
+    this.convId = convId;
+    this.vault = vault;
+  }
+
+  push(chunk: string): SseDetokenizeResult {
+    this.carry += chunk;
+    const out: string[] = [];
+    let idx: number;
+    while ((idx = this.carry.indexOf("\n\n")) !== -1) {
+      const rawEvent = this.carry.slice(0, idx);
+      this.carry = this.carry.slice(idx + 2);
+      out.push(this.processEvent(rawEvent));
+    }
+    return { emit: out.join("") };
+  }
+
+  flush(): SseDetokenizeResult {
+    const out: string[] = [];
+    if (this.carry.length > 0) {
+      const rawEvent = this.carry;
+      this.carry = "";
+      out.push(this.processEvent(rawEvent));
+    }
+    // Drain tails.
+    for (const [index, buf] of this.blocks) {
+      if (buf.emittedLen >= buf.buffer.length) continue;
+      const tail = buf.buffer.slice(buf.emittedLen);
+      const detoked = detokenize(tail, this.convId, this.vault);
+      const deltaType =
+        buf.type === "thinking"
+          ? "thinking_delta"
+          : buf.type === "partial_json"
+            ? "input_json_delta"
+            : "text_delta";
+      const deltaField =
+        buf.type === "thinking"
+          ? "thinking"
+          : buf.type === "partial_json"
+            ? "partial_json"
+            : "text";
+      const frame = {
+        type: "content_block_delta",
+        index,
+        delta: { type: deltaType, [deltaField]: detoked },
+      };
+      out.push(`data: ${JSON.stringify(frame)}\n\n`);
+      buf.emittedLen = buf.buffer.length;
+    }
+    this.blocks.clear();
+    return { emit: out.join("") };
+  }
+
+  private processEvent(rawEvent: string): string {
+    const lines = rawEvent.split(/\r?\n/);
+    const outLines: string[] = [];
+    for (const line of lines) {
+      if (!line.startsWith("data:")) {
+        outLines.push(line);
+        continue;
+      }
+      const payload = line.slice(5).trimStart();
+      if (!payload || payload === "[DONE]") {
+        outLines.push(line);
+        continue;
+      }
+      let parsed: {
+        type?: string;
+        index?: number;
+        content_block?: { type?: string; text?: string };
+        delta?: {
+          type?: string;
+          text?: string;
+          thinking?: string;
+          partial_json?: string;
+        };
+      };
+      try {
+        parsed = JSON.parse(payload) as typeof parsed;
+      } catch {
+        outLines.push(line);
+        continue;
+      }
+      const type = parsed.type;
+      if (type === "content_block_start" && typeof parsed.index === "number") {
+        const cb = parsed.content_block ?? {};
+        const btype: "text" | "thinking" | "partial_json" =
+          cb.type === "thinking"
+            ? "thinking"
+            : cb.type === "tool_use" || cb.type === "input_json_delta"
+              ? "partial_json"
+              : "text";
+        const initial = typeof cb.text === "string" ? cb.text : "";
+        this.blocks.set(parsed.index, {
+          buffer: initial,
+          type: btype,
+          emittedLen: 0,
+        });
+        if (cb.text !== undefined) cb.text = "";
+        outLines.push(`data: ${JSON.stringify(parsed)}`);
+        continue;
+      }
+      if (type === "content_block_delta" && typeof parsed.index === "number") {
+        const delta = parsed.delta ?? {};
+        const field: "text" | "thinking" | "partial_json" | null =
+          typeof delta.text === "string"
+            ? "text"
+            : typeof delta.thinking === "string"
+              ? "thinking"
+              : typeof delta.partial_json === "string"
+                ? "partial_json"
+                : null;
+        if (field === null) {
+          outLines.push(line);
+          continue;
+        }
+        let buf = this.blocks.get(parsed.index);
+        if (!buf) {
+          buf = { buffer: "", type: field, emittedLen: 0 };
+          this.blocks.set(parsed.index, buf);
+        }
+        const incoming = (delta[field] as string) ?? "";
+        buf.buffer += incoming;
+        const safeEnd = Math.max(0, buf.buffer.length - HOLD_BACK);
+        const unscannedSafeEnd = Math.max(0, safeEnd - buf.emittedLen);
+        if (unscannedSafeEnd <= 0) {
+          (delta as Record<string, string>)[field] = "";
+          outLines.push(`data: ${JSON.stringify(parsed)}`);
+          continue;
+        }
+        const safeSlice = buf.buffer.slice(
+          buf.emittedLen,
+          buf.emittedLen + unscannedSafeEnd,
+        );
+        const detoked = detokenize(safeSlice, this.convId, this.vault);
+        (delta as Record<string, string>)[field] = detoked;
+        buf.emittedLen += safeSlice.length;
+        outLines.push(`data: ${JSON.stringify(parsed)}`);
+        continue;
+      }
+      if (type === "content_block_stop" && typeof parsed.index === "number") {
+        const buf = this.blocks.get(parsed.index);
+        if (buf && buf.emittedLen < buf.buffer.length) {
+          const tail = buf.buffer.slice(buf.emittedLen);
+          const detoked = detokenize(tail, this.convId, this.vault);
+          const deltaType =
+            buf.type === "thinking"
+              ? "thinking_delta"
+              : buf.type === "partial_json"
+                ? "input_json_delta"
+                : "text_delta";
+          const deltaField =
+            buf.type === "thinking"
+              ? "thinking"
+              : buf.type === "partial_json"
+                ? "partial_json"
+                : "text";
+          const flushFrame = {
+            type: "content_block_delta",
+            index: parsed.index,
+            delta: { type: deltaType, [deltaField]: detoked },
+          };
+          outLines.push(`data: ${JSON.stringify(flushFrame)}`);
+          outLines.push("");
+          buf.emittedLen = buf.buffer.length;
+        }
+        this.blocks.delete(parsed.index);
+        outLines.push(line);
+        continue;
+      }
+      if (type === "message_stop") {
+        this.blocks.clear();
+        outLines.push(line);
+        continue;
+      }
+      outLines.push(line);
+    }
+    return outLines.join("\n") + "\n\n";
+  }
+}
+
 export function redactStreamingChunk(
   chunk: string,
   patterns: CompiledPattern[],

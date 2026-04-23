@@ -19,8 +19,15 @@ const safeRegex: (re: RegExp | string) => boolean = safeRegexDefault as any;
 const DlpPatternSchema = z.object({
   name: z.string().min(1),
   regex: z.string().min(1),
-  policy: z.enum(["block", "redact"]),
+  policy: z.enum(["block", "redact", "tokenize"]),
   replacement: z.string().optional(),
+});
+
+const DictionaryEntrySchema = z.object({
+  term: z.string().min(1),
+  classifier: z.string().min(1),
+  policy: z.enum(["block", "redact", "tokenize"]),
+  tenantId: z.string().optional(),
 });
 
 export const ProxyConfigSchema = z.object({
@@ -58,9 +65,26 @@ export const ProxyConfigSchema = z.object({
   auth: z.object({
     tokenEnv: z.string().min(1).default("OMC_PROXY_CLIENT_TOKEN"),
   }),
+  vault: z
+    .object({
+      ttlSeconds: z.number().int().positive().default(86400),
+    })
+    .default({ ttlSeconds: 86400 }),
+  dictionary: z
+    .object({
+      path: z.string().optional(),
+      entries: z.array(DictionaryEntrySchema).default([]),
+    })
+    .default({ entries: [] }),
+  conversation: z
+    .object({
+      headerName: z.string().min(1).default("X-OMC-Conversation-Id"),
+    })
+    .default({ headerName: "X-OMC-Conversation-Id" }),
 });
 
 export type DlpPattern = z.infer<typeof DlpPatternSchema>;
+export type DictionaryEntryConfig = z.infer<typeof DictionaryEntrySchema>;
 export type ProxyConfig = z.infer<typeof ProxyConfigSchema>;
 
 export const DEFAULT_CONFIG: ProxyConfig = ProxyConfigSchema.parse({
@@ -142,6 +166,15 @@ export const DEFAULT_CONFIG: ProxyConfig = ProxyConfigSchema.parse({
   auth: {
     tokenEnv: "OMC_PROXY_CLIENT_TOKEN",
   },
+  vault: {
+    ttlSeconds: 86400,
+  },
+  dictionary: {
+    entries: [],
+  },
+  conversation: {
+    headerName: "X-OMC-Conversation-Id",
+  },
 });
 
 export function defaultConfigPath(): string {
@@ -214,7 +247,7 @@ function envOverrides(): Partial<ProxyConfig> {
 export interface CompiledPattern {
   name: string;
   regex: RegExp;
-  policy: "block" | "redact";
+  policy: "block" | "redact" | "tokenize";
   replacement?: string;
 }
 

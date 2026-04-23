@@ -19,7 +19,7 @@ import { applyPolicy } from "./dlp.js";
 
 export interface DlpMatchSummary {
   name: string;
-  policy: "block" | "redact";
+  policy: "block" | "redact" | "tokenize";
   count: number;
 }
 
@@ -48,7 +48,10 @@ export interface AuditEvent {
 }
 
 export function summarizeMatches(matches: DlpMatch[]): DlpMatchSummary[] {
-  const counts = new Map<string, { policy: "block" | "redact"; count: number }>();
+  const counts = new Map<
+    string,
+    { policy: "block" | "redact" | "tokenize"; count: number }
+  >();
   for (const m of matches) {
     const prev = counts.get(m.patternName);
     if (prev) prev.count += 1;

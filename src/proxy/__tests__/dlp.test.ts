@@ -2,12 +2,15 @@ import { describe, it, expect } from "vitest";
 import {
   applyPolicy,
   compilePatterns,
+  detokenize,
   redactAnthropicRequest,
   redactStreamingChunk,
   scan,
+  SseDetokenizer,
   SseRedactor,
   type DlpRawPattern,
 } from "../dlp.js";
+import { InProcessTokenVault } from "../vault.js";
 
 const defaults: DlpRawPattern[] = [
   {
@@ -348,3 +351,98 @@ describe("redactStreamingChunk", () => {
     expect(r.output).toBe("data: {not-json\n");
   });
 });
+
+describe("tokenize policy + detokenize round-trip", () => {
+  const tokenizingPatterns: DlpRawPattern[] = [
+    {
+      name: "email",
+      regex: "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}",
+      policy: "tokenize",
+    },
+  ];
+
+  it("tokenize policy issues tokens and substitutes the match", () => {
+    const patterns = compilePatterns(tokenizingPatterns);
+    const vault = new InProcessTokenVault();
+    const r = applyPolicy(
+      "email alice@example.com and bob@example.com please",
+      patterns,
+      { vault: { convId: "c1", vault } },
+    );
+    expect(r.blocked).toBe(false);
+    expect(r.output).toContain("EMAIL_01");
+    expect(r.output).toContain("EMAIL_02");
+    expect(r.output).not.toContain("alice@example.com");
+    expect(vault.lookup("c1", "EMAIL_01")).toBe("alice@example.com");
+    expect(vault.lookup("c1", "EMAIL_02")).toBe("bob@example.com");
+  });
+
+  it("detokenize restores original values from the vault", () => {
+    const vault = new InProcessTokenVault();
+    vault.issue("c1", "email", "alice@example.com");
+    const out = detokenize("Hi EMAIL_01, ping me.", "c1", vault);
+    expect(out).toBe("Hi alice@example.com, ping me.");
+  });
+
+  it("unknown tokens pass through detokenize unchanged", () => {
+    const vault = new InProcessTokenVault();
+    const out = detokenize("unknown UNKNOWN_99 token", "c1", vault);
+    expect(out).toBe("unknown UNKNOWN_99 token");
+  });
+
+  it("round-trip: tokenize -> upstream echoes token -> detokenize gives original", () => {
+    const patterns = compilePatterns(tokenizingPatterns);
+    const vault = new InProcessTokenVault();
+    const req = applyPolicy(
+      "my email is alice@example.com so please remember it",
+      patterns,
+      { vault: { convId: "conv-x", vault } },
+    );
+    // The token the model now sees:
+    const token = req.output.match(/EMAIL_\d{2,3}/)![0];
+    // Simulate upstream echoing the token back in a reply.
+    const simulatedUpstream = `Sure, I will email you at ${token} shortly.`;
+    const clientSees = detokenize(simulatedUpstream, "conv-x", vault);
+    expect(clientSees).toBe(
+      "Sure, I will email you at alice@example.com shortly.",
+    );
+  });
+
+  it("SseDetokenizer restores tokens split across SSE deltas", () => {
+    const vault = new InProcessTokenVault();
+    vault.issue("c1", "email", "alice@example.com");
+    const detok = new SseDetokenizer("c1", vault);
+    const makeDelta = (text: string): string =>
+      `event: content_block_delta\ndata: ${JSON.stringify({
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text },
+      })}\n\n`;
+    const stop = `event: content_block_stop\ndata: ${JSON.stringify({
+      type: "content_block_stop",
+      index: 0,
+    })}\n\n`;
+    const parts = [makeDelta("hi "), makeDelta("EMA"), makeDelta("IL_01"), makeDelta(" ok"), stop];
+    let out = "";
+    for (const p of parts) out += detok.push(p).emit;
+    out += detok.flush().emit;
+    expect(out).toContain("alice@example.com");
+    expect(out).not.toContain("EMAIL_01");
+  });
+
+  it("redactAnthropicRequest injects DLP preservation instruction into system when tokenizing", () => {
+    const patterns = compilePatterns(tokenizingPatterns);
+    const vault = new InProcessTokenVault();
+    const r = redactAnthropicRequest(
+      {
+        system: "You are a helpful assistant.",
+        messages: [{ role: "user", content: "email me at x@y.com" }],
+      },
+      patterns,
+      { vault: { convId: "c1", vault } },
+    );
+    expect(typeof r.body.system).toBe("string");
+    expect(r.body.system as string).toContain("[OMC-DLP]");
+  });
+});
+

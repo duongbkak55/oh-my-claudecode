@@ -4,15 +4,21 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "http";
-import { randomUUID, timingSafeEqual } from "crypto";
+import { readFileSync, existsSync } from "fs";
+import { randomUUID, timingSafeEqual, createHash } from "crypto";
 import { once } from "events";
 import type { ProxyConfig } from "./config.js";
 import { compileConfigPatterns } from "./config.js";
 import {
   redactAnthropicRequest,
   SseRedactor,
+  SseDetokenizer,
+  detokenizeValue,
   type AnthropicRequestBody,
+  type VaultContext,
 } from "./dlp.js";
+import { InProcessTokenVault } from "./vault.js";
+import { Dictionary, type DictionaryEntry } from "./dictionary.js";
 import { scanRequestForBannedTools, validateUpstreamUrl } from "./allowlist.js";
 import { auditEvent, summarizeMatches } from "./audit.js";
 import {
@@ -144,6 +150,61 @@ export async function startProxy(opts: StartProxyOptions): Promise<StartedProxy>
 
   const patterns = compileConfigPatterns(config);
   const tools = defaultToolRegistry();
+  const vault = new InProcessTokenVault({
+    ttlMs: config.vault.ttlSeconds * 1000,
+  });
+  const dictionaryEntries: DictionaryEntry[] = [
+    ...(config.dictionary.entries ?? []),
+  ];
+  if (config.dictionary.path && existsSync(config.dictionary.path)) {
+    try {
+      const raw = readFileSync(config.dictionary.path, "utf-8");
+      const extra = JSON.parse(raw) as DictionaryEntry[];
+      if (Array.isArray(extra)) {
+        for (const e of extra) dictionaryEntries.push(e);
+      }
+    } catch {
+      // Silent: bad dict file shouldn't take the proxy down.
+    }
+  }
+  const dictionary =
+    dictionaryEntries.length > 0 ? new Dictionary(dictionaryEntries) : undefined;
+  const convHeaderLower = config.conversation.headerName.toLowerCase();
+  const CONV_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+  function deriveConversationId(
+    req: IncomingMessage,
+    body: AnthropicRequestBody,
+  ): string {
+    const hdr = req.headers[convHeaderLower];
+    const headerVal = Array.isArray(hdr) ? hdr[0] : hdr;
+    if (typeof headerVal === "string" && CONV_ID_RE.test(headerVal)) {
+      return headerVal;
+    }
+    const auth = req.headers["authorization"];
+    const token =
+      typeof auth === "string" && auth.startsWith("Bearer ")
+        ? auth.slice("Bearer ".length).trim().slice(0, 16)
+        : "anon";
+    let sys = "";
+    if (typeof body.system === "string") sys = body.system;
+    else if (Array.isArray(body.system)) {
+      for (const b of body.system) {
+        if (b && typeof b.text === "string") {
+          sys += b.text;
+          if (sys.length > 512) break;
+        }
+      }
+    }
+    if (token !== "anon" || sys.length > 0) {
+      return createHash("sha256")
+        .update(token + sys.slice(0, 512))
+        .digest("hex")
+        .slice(0, 16);
+    }
+    return randomUUID().replace(/-/g, "").slice(0, 16);
+  }
+
   const metrics: Metrics = {
     requests_total: 0,
     blocked_total: 0,
@@ -285,7 +346,12 @@ export async function startProxy(opts: StartProxyOptions): Promise<StartedProxy>
           return;
         }
 
-        const dlp = redactAnthropicRequest(parsed, patterns);
+        const convId = deriveConversationId(req, parsed);
+        const vaultCtx: VaultContext = { convId, vault };
+        const dlp = redactAnthropicRequest(parsed, patterns, {
+          vault: vaultCtx,
+          dictionary,
+        });
         if (dlp.blocked) {
           metrics.blocked_total += 1;
           auditEvent(config.audit.dir, {
@@ -451,7 +517,22 @@ export async function startProxy(opts: StartProxyOptions): Promise<StartedProxy>
           let bytesOut = 0;
           let streamRedacted = 0;
           let streamBlocked = false;
-          const sseRedactor = new SseRedactor(patterns);
+          // Outbound (client→upstream) was already redacted/tokenized before
+          // the fetch. On the inbound (upstream→client) stream, first
+          // detokenize so echoed tokens become originals, then run the
+          // redactor as a safety net in case the model emits a brand-new
+          // secret (not from vault) that matches a block/redact pattern.
+          //
+          // IMPORTANT: the redactor in this direction uses a fresh policy
+          // set with tokenize patterns DOWNGRADED to redact — otherwise the
+          // redactor would swap the just-detokenized originals back into
+          // tokens and the client would see opaque identifiers. Dictionary
+          // is passed through only for blocking purposes.
+          const inboundPatterns = patterns.map((p) =>
+            p.policy === "tokenize" ? { ...p, policy: "redact" as const } : p,
+          );
+          const sseDetok = new SseDetokenizer(convId, vault);
+          const sseRedactor = new SseRedactor(inboundPatterns);
           const writeWithBackpressure = async (
             chunk: string,
           ): Promise<void> => {
@@ -465,7 +546,8 @@ export async function startProxy(opts: StartProxyOptions): Promise<StartedProxy>
               const { done, value } = await reader.read();
               if (done) break;
               const decoded = decoder.decode(value, { stream: true });
-              const pushed = sseRedactor.push(decoded);
+              const detoked = sseDetok.push(decoded);
+              const pushed = sseRedactor.push(detoked.emit);
               streamRedacted += pushed.matches.length;
               if (pushed.emit.length > 0) {
                 await writeWithBackpressure(pushed.emit);
@@ -482,12 +564,21 @@ export async function startProxy(opts: StartProxyOptions): Promise<StartedProxy>
               }
             }
             if (!streamBlocked) {
-              const tail = sseRedactor.flush();
-              streamRedacted += tail.matches.length;
-              if (tail.emit.length > 0) {
-                await writeWithBackpressure(tail.emit);
+              const detokTail = sseDetok.flush();
+              const redactTail = sseRedactor.push(detokTail.emit);
+              streamRedacted += redactTail.matches.length;
+              if (redactTail.emit.length > 0) {
+                await writeWithBackpressure(redactTail.emit);
               }
-              if (tail.blocked) streamBlocked = true;
+              if (redactTail.blocked) streamBlocked = true;
+              if (!streamBlocked) {
+                const tail = sseRedactor.flush();
+                streamRedacted += tail.matches.length;
+                if (tail.emit.length > 0) {
+                  await writeWithBackpressure(tail.emit);
+                }
+                if (tail.blocked) streamBlocked = true;
+              }
             }
           } catch (err) {
             metrics.errors_total += 1;
@@ -524,15 +615,27 @@ export async function startProxy(opts: StartProxyOptions): Promise<StartedProxy>
 
         req.off("close", onClientClose);
         const respText = await upstreamResp.text();
+        const contentType =
+          upstreamResp.headers.get("content-type") ?? "application/json";
+        let outText = respText;
+        if (contentType.includes("application/json")) {
+          try {
+            const json = JSON.parse(respText) as unknown;
+            const detoked = detokenizeValue(json, convId, vault);
+            outText = JSON.stringify(detoked);
+          } catch {
+            // non-JSON or malformed — forward as-is.
+          }
+        }
         res.writeHead(upstreamResp.status, {
-          "content-type": upstreamResp.headers.get("content-type") ?? "application/json",
+          "content-type": contentType,
         });
-        res.end(respText);
+        res.end(outText);
         auditEvent(config.audit.dir, {
           reqId,
           phase: "response",
           model: redactedBody.model,
-          bytesOut: Buffer.byteLength(respText),
+          bytesOut: Buffer.byteLength(outText),
           latencyMs: Date.now() - started,
         });
         return;

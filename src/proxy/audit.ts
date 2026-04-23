@@ -10,10 +10,12 @@
  * Never log raw sensitive text. Only pattern names + counts are persisted.
  */
 
-import { appendFileSync, openSync, fsyncSync, closeSync } from "fs";
+import { openSync, writeSync, fsyncSync, closeSync } from "fs";
 import { join } from "path";
 import { ensureDirSync } from "../lib/atomic-write.js";
 import type { DlpMatch } from "./dlp.js";
+import type { CompiledPattern } from "./config.js";
+import { applyPolicy } from "./dlp.js";
 
 export interface DlpMatchSummary {
   name: string;
@@ -66,26 +68,36 @@ function currentDayFile(dir: string, now: Date = new Date()): string {
   return join(dir, `${y}-${m}-${d}.jsonl`);
 }
 
-export function auditEvent(dir: string, event: AuditEvent): void {
+export function auditEvent(
+  dir: string,
+  event: AuditEvent,
+  patterns?: CompiledPattern[],
+): void {
   ensureDirSync(dir);
   const withTs: AuditEvent = {
     ...event,
     ts: event.ts ?? new Date().toISOString(),
   };
+  // Belt-and-braces: if the caller passed compiled DLP patterns and the
+  // event has an `error` string, scan that string so a raw upstream/stack
+  // snippet can't accidentally persist a secret to audit.
+  if (patterns && patterns.length > 0 && typeof withTs.error === "string") {
+    const r = applyPolicy(withTs.error, patterns);
+    withTs.error = r.blocked ? "[BLOCKED:dlp]" : r.output;
+  }
   const file = currentDayFile(dir);
   const line = JSON.stringify(withTs) + "\n";
-  appendFileSync(file, line, { encoding: "utf-8", mode: 0o600 });
-  // Durability: fsync the file after append so crashes don't lose audit.
+  // Open append-fd once, write, fsync, close — durability on the writable fd.
+  const fd = openSync(file, "a", 0o600);
   try {
-    const fd = openSync(file, "r");
+    writeSync(fd, line);
     try {
       fsyncSync(fd);
-    } finally {
-      closeSync(fd);
+    } catch {
+      // Some filesystems don't support fsync; best-effort only.
     }
-  } catch {
-    // Some filesystems/platforms may reject fsync on an opened-for-read fd.
-    // Best-effort only.
+  } finally {
+    closeSync(fd);
   }
 }
 

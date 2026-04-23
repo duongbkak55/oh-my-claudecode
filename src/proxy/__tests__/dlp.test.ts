@@ -5,6 +5,7 @@ import {
   redactAnthropicRequest,
   redactStreamingChunk,
   scan,
+  SseRedactor,
   type DlpRawPattern,
 } from "../dlp.js";
 
@@ -142,6 +143,187 @@ describe("redactAnthropicRequest", () => {
     const r = redactAnthropicRequest(body, patterns);
     expect(r.blocked).toBe(true);
     expect(r.blockedReasons).toContain("aws_access_key");
+  });
+});
+
+describe("redactAnthropicRequest extended coverage", () => {
+  it("redacts secrets embedded in tools[].description", () => {
+    const patterns = compilePatterns(defaults);
+    const body = {
+      tools: [
+        {
+          name: "fetcher",
+          description: "contact admin at admin@corp.local to get access",
+        },
+      ],
+    };
+    const r = redactAnthropicRequest(body, patterns);
+    const desc = (r.body.tools![0] as unknown as { description: string })
+      .description;
+    expect(desc).toContain("[REDACTED:email]");
+    expect(desc).not.toContain("admin@corp.local");
+  });
+
+  it("recursively redacts strings inside tools[].input_schema", () => {
+    const patterns = compilePatterns(defaults);
+    const body = {
+      tools: [
+        {
+          name: "fetcher",
+          input_schema: {
+            type: "object",
+            properties: {
+              q: {
+                type: "string",
+                description: "default user is bob@example.com",
+              },
+            },
+          },
+        },
+      ],
+    };
+    const r = redactAnthropicRequest(body, patterns);
+    const schema = (
+      r.body.tools![0] as unknown as {
+        input_schema: { properties: { q: { description: string } } };
+      }
+    ).input_schema;
+    expect(schema.properties.q.description).toContain("[REDACTED:email]");
+    expect(schema.properties.q.description).not.toContain("bob@example.com");
+  });
+
+  it("redacts secrets in nested tool_result.content[].text", () => {
+    const patterns = compilePatterns(defaults);
+    const body = {
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tu_1",
+              content: [
+                { type: "text", text: "here is your email: x@y.com" },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const r = redactAnthropicRequest(body, patterns);
+    const msg = r.body.messages![0]!;
+    const blocks = Array.isArray(msg.content) ? msg.content : [];
+    const tr = blocks[0] as { content?: Array<{ text?: string }> };
+    expect(tr.content?.[0]?.text).toContain("[REDACTED:email]");
+    expect(tr.content?.[0]?.text).not.toContain("x@y.com");
+  });
+
+  it("redacts secrets in system array form", () => {
+    const patterns = compilePatterns(defaults);
+    const body = {
+      system: [
+        { type: "text", text: "admin: foo@bar.baz" },
+      ],
+    };
+    const r = redactAnthropicRequest(body, patterns);
+    const sys = Array.isArray(r.body.system) ? r.body.system : [];
+    expect((sys[0] as { text?: string }).text).toContain("[REDACTED:email]");
+  });
+
+  it("does NOT scan structural keys (name/type/id/etc.) — no false positives on a tool named 'sk-test-tool'", () => {
+    const patterns = compilePatterns(defaults);
+    const body = {
+      tools: [
+        {
+          name: "sk-test-tool-abcdefghijklmnopqrstuv",
+          description: "ok",
+        },
+      ],
+    };
+    const r = redactAnthropicRequest(body, patterns);
+    expect(r.blocked).toBe(false);
+    // The tool name string is preserved as-is (it's a structural key).
+    expect((r.body.tools![0] as { name: string }).name).toBe(
+      "sk-test-tool-abcdefghijklmnopqrstuv",
+    );
+  });
+});
+
+describe("SseRedactor (rolling, cross-frame)", () => {
+  it("blocks an sk- secret split across chunk boundaries", () => {
+    const patterns = compilePatterns([
+      ...defaults,
+      {
+        name: "generic_api_key",
+        regex: "sk-[A-Za-z0-9_-]{20,}",
+        policy: "block",
+      },
+    ]);
+    const r = new SseRedactor(patterns);
+    const makeDelta = (text: string): string =>
+      `event: content_block_delta\ndata: ${JSON.stringify({
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text },
+      })}\n\n`;
+    const chunks = [
+      makeDelta("here goes sk-"),
+      makeDelta("ant-"),
+      makeDelta("abcdefghijklmnopqrstuvwxyz1234567890AAAA"),
+    ];
+    let all = "";
+    let blocked = false;
+    for (const c of chunks) {
+      const res = r.push(c);
+      all += res.emit;
+      if (res.blocked) blocked = true;
+    }
+    if (!blocked) {
+      const tail = r.flush();
+      all += tail.emit;
+      blocked = blocked || tail.blocked;
+    }
+    expect(blocked).toBe(true);
+    // The raw secret must not leak through.
+    expect(all).not.toContain(
+      "sk-ant-abcdefghijklmnopqrstuvwxyz1234567890",
+    );
+    expect(all).toContain("dlp_blocked");
+  });
+
+  it("redacts JWT in delta.thinking", () => {
+    const patterns = compilePatterns(defaults);
+    const r = new SseRedactor(patterns);
+    const jwt =
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+    const frame = `event: content_block_delta\ndata: ${JSON.stringify({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "thinking_delta", thinking: `contemplating ${jwt} hmm` },
+    })}\n\n`;
+    const pushed = r.push(frame);
+    const tail = r.flush();
+    const out = pushed.emit + tail.emit;
+    expect(out).not.toContain(jwt);
+    expect(pushed.blocked || tail.blocked).toBe(true);
+  });
+
+  it("redacts email in delta.partial_json", () => {
+    const patterns = compilePatterns(defaults);
+    const r = new SseRedactor(patterns);
+    const frame = `event: content_block_delta\ndata: ${JSON.stringify({
+      type: "content_block_delta",
+      index: 0,
+      delta: {
+        type: "input_json_delta",
+        partial_json: '{"who":"me@you.com"}',
+      },
+    })}\n\n`;
+    const pushed = r.push(frame);
+    const tail = r.flush();
+    const out = pushed.emit + tail.emit;
+    expect(out).toContain("[REDACTED:email]");
+    expect(out).not.toContain("me@you.com");
   });
 });
 

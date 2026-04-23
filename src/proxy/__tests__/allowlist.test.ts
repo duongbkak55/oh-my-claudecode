@@ -1,4 +1,7 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach, beforeEach } from "vitest";
+import { mkdtempSync, symlinkSync, writeFileSync, mkdirSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
   scanRequestForBannedTools,
   validateToolCall,
@@ -72,6 +75,91 @@ describe("validateToolCall", () => {
   });
 });
 
+describe("validateToolCall recursive input scanning", () => {
+  it("blocks URL in alternative key like target_url", () => {
+    const r = validateToolCall(
+      { name: "fetch_url", input: { target_url: "http://10.0.0.1" } },
+      allowlist,
+    );
+    expect(r.allowed).toBe(false);
+    expect(r.reason).toMatch(/SSRF|urlDomains/);
+  });
+
+  it("blocks URL nested inside a sub-object", () => {
+    const r = validateToolCall(
+      {
+        name: "fetch_url",
+        input: { request: { url: "https://api.evil.com/x" } },
+      },
+      allowlist,
+    );
+    expect(r.allowed).toBe(false);
+    expect(r.reason).toMatch(/urlDomains/);
+  });
+
+  it("blocks path under a non-standard key like filepath", () => {
+    const r = validateToolCall(
+      { name: "echo", input: { filepath: "/etc/passwd" } },
+      allowlist,
+    );
+    expect(r.allowed).toBe(false);
+    expect(r.reason).toMatch(/pathPrefixes/);
+  });
+
+  it("does NOT block prose that merely contains a URL", () => {
+    const r = validateToolCall(
+      {
+        name: "echo",
+        input: {
+          description: "See https://example.com/foo for more context.",
+        },
+      },
+      allowlist,
+    );
+    // prose, not entirely a URL — lenient
+    expect(r.allowed).toBe(true);
+  });
+
+  describe("with filesystem symlink", () => {
+    let tmpRoot: string;
+    let outside: string;
+    let allowedRoot: string;
+    let symlinkPath: string;
+
+    beforeEach(() => {
+      tmpRoot = mkdtempSync(join(tmpdir(), "omc-allowlist-sym-"));
+      allowedRoot = join(tmpRoot, "allowed");
+      mkdirSync(allowedRoot);
+      outside = join(tmpRoot, "outside.txt");
+      writeFileSync(outside, "secret");
+      symlinkPath = join(allowedRoot, "escape");
+      symlinkSync(outside, symlinkPath);
+    });
+
+    afterEach(() => {
+      try {
+        rmSync(tmpRoot, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+    });
+
+    it("blocks symlink inside allowed prefix that points outside", () => {
+      const localAllowlist = {
+        mcpTools: ["echo"],
+        urlDomains: [],
+        pathPrefixes: [allowedRoot],
+      };
+      const r = validateToolCall(
+        { name: "echo", input: { file_path: symlinkPath } },
+        localAllowlist,
+      );
+      expect(r.allowed).toBe(false);
+      expect(r.reason).toMatch(/pathPrefixes/);
+    });
+  });
+});
+
 describe("validateUpstreamUrl", () => {
   it("allows upstream host even if not in urlDomains", () => {
     const r = validateUpstreamUrl(
@@ -80,6 +168,36 @@ describe("validateUpstreamUrl", () => {
       "https://api.anthropic.com",
     );
     expect(r.allowed).toBe(true);
+  });
+
+  it("blocks http upstream by default", () => {
+    const prev = process.env.OMC_PROXY_ALLOW_HTTP_UPSTREAM;
+    delete process.env.OMC_PROXY_ALLOW_HTTP_UPSTREAM;
+    try {
+      const r = validateUpstreamUrl(
+        "http://api.anthropic.com/v1/messages",
+        { mcpTools: [], urlDomains: [], pathPrefixes: [] },
+        "http://api.anthropic.com",
+      );
+      expect(r.allowed).toBe(false);
+      expect(r.reason).toMatch(/https/);
+    } finally {
+      if (prev !== undefined) process.env.OMC_PROXY_ALLOW_HTTP_UPSTREAM = prev;
+    }
+  });
+
+  it("allows http upstream when escape-hatch env is set", () => {
+    process.env.OMC_PROXY_ALLOW_HTTP_UPSTREAM = "1";
+    try {
+      const r = validateUpstreamUrl(
+        "http://api.anthropic.com/v1/messages",
+        { mcpTools: [], urlDomains: [], pathPrefixes: [] },
+        "http://api.anthropic.com",
+      );
+      expect(r.allowed).toBe(true);
+    } finally {
+      delete process.env.OMC_PROXY_ALLOW_HTTP_UPSTREAM;
+    }
   });
 
   it("blocks private IPs for upstream", () => {

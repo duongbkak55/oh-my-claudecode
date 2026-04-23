@@ -53,6 +53,10 @@ export const ProxyConfigSchema = z.object({
   agentLoop: z.object({
     enabled: z.boolean().default(false),
     maxIterations: z.number().int().positive().default(5),
+    maxToolOutputBytes: z.number().int().positive().default(100_000),
+  }),
+  auth: z.object({
+    tokenEnv: z.string().min(1).default("OMC_PROXY_CLIENT_TOKEN"),
   }),
 });
 
@@ -133,6 +137,10 @@ export const DEFAULT_CONFIG: ProxyConfig = ProxyConfigSchema.parse({
   agentLoop: {
     enabled: false,
     maxIterations: 5,
+    maxToolOutputBytes: 100_000,
+  },
+  auth: {
+    tokenEnv: "OMC_PROXY_CLIENT_TOKEN",
   },
 });
 

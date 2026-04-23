@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, readdirSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { auditEvent, auditFilePath, summarizeMatches } from "../audit.js";
-import type { DlpMatch } from "../dlp.js";
+import { compilePatterns, type DlpMatch } from "../dlp.js";
 
 function freshDir(): string {
   return mkdtempSync(join(tmpdir(), "omc-proxy-audit-"));
@@ -64,5 +64,39 @@ describe("audit", () => {
     auditEvent(nested, { reqId: "x", phase: "request" });
     const files = readdirSync(nested);
     expect(files.some((f) => f.endsWith(".jsonl"))).toBe(true);
+  });
+
+  it("persists writes durably — data reads back after a single write", () => {
+    // Smoke test for the fsync-on-writable-fd path.
+    auditEvent(dir, { reqId: "durable-1", phase: "request" });
+    const file = auditFilePath(dir);
+    const content = readFileSync(file, "utf-8");
+    const lines = content.split("\n").filter((l) => l.length > 0);
+    expect(lines.length).toBe(1);
+    const parsed = JSON.parse(lines[0]!);
+    expect(parsed.reqId).toBe("durable-1");
+  });
+
+  it("DLP-scans event.error when patterns are provided", () => {
+    const patterns = compilePatterns([
+      {
+        name: "email",
+        regex: "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}",
+        policy: "redact",
+      },
+    ]);
+    auditEvent(
+      dir,
+      {
+        reqId: "scan-1",
+        phase: "error",
+        error: "upstream said: leaked@corp.local was bad",
+      },
+      patterns,
+    );
+    const file = auditFilePath(dir);
+    const content = readFileSync(file, "utf-8");
+    expect(content).not.toContain("leaked@corp.local");
+    expect(content).toContain("[REDACTED:email]");
   });
 });

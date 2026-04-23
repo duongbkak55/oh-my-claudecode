@@ -4,12 +4,13 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "http";
-import { randomUUID } from "crypto";
+import { randomUUID, timingSafeEqual } from "crypto";
+import { once } from "events";
 import type { ProxyConfig } from "./config.js";
 import { compileConfigPatterns } from "./config.js";
 import {
   redactAnthropicRequest,
-  redactStreamingChunk,
+  SseRedactor,
   type AnthropicRequestBody,
 } from "./dlp.js";
 import { scanRequestForBannedTools, validateUpstreamUrl } from "./allowlist.js";
@@ -17,8 +18,9 @@ import { auditEvent, summarizeMatches } from "./audit.js";
 import {
   defaultToolRegistry,
   runAgentLoop,
+  parseUpstreamResponse,
+  UpstreamShapeError,
   type UpstreamClient,
-  type UpstreamResponse,
 } from "./agent-loop.js";
 
 interface Metrics {
@@ -67,9 +69,57 @@ function writeJson(res: ServerResponse, status: number, body: unknown): void {
 }
 
 function clientIp(req: IncomingMessage): string {
-  const xf = req.headers["x-forwarded-for"];
-  if (typeof xf === "string" && xf.length > 0) return xf.split(",")[0]!.trim();
+  // Only trust X-Forwarded-For when explicitly enabled; otherwise a client
+  // can spoof their source IP by setting the header directly.
+  if (process.env.OMC_PROXY_TRUST_PROXY === "1") {
+    const xf = req.headers["x-forwarded-for"];
+    if (typeof xf === "string" && xf.length > 0) return xf.split(",")[0]!.trim();
+  }
   return req.socket.remoteAddress ?? "unknown";
+}
+
+function constantTimeTokenMatch(expected: string, provided: string): boolean {
+  const a = Buffer.from(expected, "utf-8");
+  const b = Buffer.from(provided, "utf-8");
+  if (a.length !== b.length) {
+    // Still burn the time so length is not a side channel for the short one.
+    const pad = Buffer.alloc(a.length, 0);
+    try {
+      timingSafeEqual(a, pad);
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
+  return timingSafeEqual(a, b);
+}
+
+/**
+ * Enforce bearer-token auth on every non-/health route. Returns true if the
+ * request has been handled (unauthorized/misconfigured responses already
+ * written); returns false if the caller should continue processing.
+ */
+function enforceProxyAuth(
+  req: IncomingMessage,
+  res: ServerResponse,
+  config: ProxyConfig,
+): boolean {
+  const expected = process.env[config.auth.tokenEnv];
+  if (!expected || expected.length === 0) {
+    writeJson(res, 503, { error: "proxy auth not configured" });
+    return true;
+  }
+  const authHeader = req.headers["authorization"];
+  if (typeof authHeader !== "string" || !authHeader.startsWith("Bearer ")) {
+    writeJson(res, 401, { error: "unauthorized" });
+    return true;
+  }
+  const provided = authHeader.slice("Bearer ".length).trim();
+  if (!constantTimeTokenMatch(expected, provided)) {
+    writeJson(res, 401, { error: "unauthorized" });
+    return true;
+  }
+  return false;
 }
 
 export interface StartProxyOptions {
@@ -124,7 +174,8 @@ export async function startProxy(opts: StartProxyOptions): Promise<StartedProxy>
         const text = await resp.text();
         throw new Error(`Upstream ${resp.status}: ${text.slice(0, 500)}`);
       }
-      return (await resp.json()) as UpstreamResponse;
+      const raw = (await resp.json()) as unknown;
+      return parseUpstreamResponse(raw);
     },
   };
 
@@ -137,6 +188,11 @@ export async function startProxy(opts: StartProxyOptions): Promise<StartedProxy>
     try {
       if (req.method === "GET" && url === "/health") {
         writeJson(res, 200, { status: "ok" });
+        return;
+      }
+
+      // All non-/health routes require bearer-token auth.
+      if (enforceProxyAuth(req, res, config)) {
         return;
       }
 
@@ -275,6 +331,9 @@ export async function startProxy(opts: StartProxyOptions): Promise<StartedProxy>
         });
 
         if (useAgentLoop) {
+          const agentAbort = new AbortController();
+          const onClose = (): void => agentAbort.abort();
+          req.on("close", onClose);
           try {
             const result = await runAgentLoop(redactedBody, {
               config,
@@ -283,6 +342,7 @@ export async function startProxy(opts: StartProxyOptions): Promise<StartedProxy>
               patterns,
               auditDir: config.audit.dir,
               reqId,
+              abortSignal: agentAbort.signal,
             });
             metrics.tool_calls_total += 1;
             writeJson(res, 200, result);
@@ -295,15 +355,25 @@ export async function startProxy(opts: StartProxyOptions): Promise<StartedProxy>
             });
           } catch (err) {
             metrics.errors_total += 1;
-            writeJson(res, 502, {
-              error: { type: "agent_loop_error", message: String(err) },
+            const isShapeErr = err instanceof UpstreamShapeError;
+            writeJson(res, isShapeErr ? 502 : 502, {
+              error: {
+                type: isShapeErr ? "upstream_invalid" : "agent_loop_error",
+                message: String(err),
+              },
             });
-            auditEvent(config.audit.dir, {
-              reqId,
-              phase: "error",
-              error: String(err),
-              latencyMs: Date.now() - started,
-            });
+            auditEvent(
+              config.audit.dir,
+              {
+                reqId,
+                phase: "error",
+                error: String(err),
+                latencyMs: Date.now() - started,
+              },
+              patterns,
+            );
+          } finally {
+            req.off("close", onClose);
           }
           return;
         }
@@ -326,6 +396,15 @@ export async function startProxy(opts: StartProxyOptions): Promise<StartedProxy>
           return;
         }
 
+        const controller = new AbortController();
+        // If the client disconnects, abort upstream fetch + reader immediately.
+        let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+        const onClientClose = (): void => {
+          controller.abort();
+          reader?.cancel().catch(() => {});
+        };
+        req.on("close", onClientClose);
+
         let upstreamResp: Response;
         try {
           upstreamResp = await fetch(upstreamUrl, {
@@ -337,18 +416,23 @@ export async function startProxy(opts: StartProxyOptions): Promise<StartedProxy>
               accept: isStream ? "text/event-stream" : "application/json",
             },
             body: JSON.stringify(redactedBody),
+            signal: controller.signal,
           });
         } catch (err) {
           metrics.errors_total += 1;
           writeJson(res, 502, {
             error: { type: "upstream_fetch_error", message: String(err) },
           });
-          auditEvent(config.audit.dir, {
-            reqId,
-            phase: "error",
-            error: String(err),
-            latencyMs: Date.now() - started,
-          });
+          auditEvent(
+            config.audit.dir,
+            {
+              reqId,
+              phase: "error",
+              error: String(err),
+              latencyMs: Date.now() - started,
+            },
+            patterns,
+          );
           return;
         }
 
@@ -362,38 +446,63 @@ export async function startProxy(opts: StartProxyOptions): Promise<StartedProxy>
             res.end();
             return;
           }
-          const reader = upstreamResp.body.getReader();
+          reader = upstreamResp.body.getReader();
           const decoder = new TextDecoder();
-          let buffer = "";
           let bytesOut = 0;
           let streamRedacted = 0;
           let streamBlocked = false;
+          const sseRedactor = new SseRedactor(patterns);
+          const writeWithBackpressure = async (
+            chunk: string,
+          ): Promise<void> => {
+            bytesOut += Buffer.byteLength(chunk);
+            if (!res.write(chunk)) {
+              await once(res, "drain");
+            }
+          };
           try {
             for (;;) {
               const { done, value } = await reader.read();
               if (done) break;
-              buffer += decoder.decode(value, { stream: true });
-              // flush by SSE events (double newline)
-              let idx: number;
-              while ((idx = buffer.indexOf("\n\n")) !== -1) {
-                const rawEvent = buffer.slice(0, idx);
-                buffer = buffer.slice(idx + 2);
-                const filtered = redactStreamingChunk(rawEvent, patterns);
-                if (filtered.blocked) streamBlocked = true;
-                streamRedacted += filtered.matches.length;
-                const outChunk = filtered.output + "\n\n";
-                bytesOut += Buffer.byteLength(outChunk);
-                res.write(outChunk);
+              const decoded = decoder.decode(value, { stream: true });
+              const pushed = sseRedactor.push(decoded);
+              streamRedacted += pushed.matches.length;
+              if (pushed.emit.length > 0) {
+                await writeWithBackpressure(pushed.emit);
+              }
+              if (pushed.blocked) {
+                streamBlocked = true;
+                try {
+                  await reader.cancel();
+                } catch {
+                  /* ignore */
+                }
+                controller.abort();
+                break;
               }
             }
-            if (buffer.length > 0) {
-              const filtered = redactStreamingChunk(buffer, patterns);
-              if (filtered.blocked) streamBlocked = true;
-              streamRedacted += filtered.matches.length;
-              bytesOut += Buffer.byteLength(filtered.output);
-              res.write(filtered.output);
+            if (!streamBlocked) {
+              const tail = sseRedactor.flush();
+              streamRedacted += tail.matches.length;
+              if (tail.emit.length > 0) {
+                await writeWithBackpressure(tail.emit);
+              }
+              if (tail.blocked) streamBlocked = true;
             }
+          } catch (err) {
+            metrics.errors_total += 1;
+            auditEvent(
+              config.audit.dir,
+              {
+                reqId,
+                phase: "error",
+                error: String(err),
+                latencyMs: Date.now() - started,
+              },
+              patterns,
+            );
           } finally {
+            req.off("close", onClientClose);
             res.end();
           }
           metrics.redacted_total += streamRedacted;
@@ -413,6 +522,7 @@ export async function startProxy(opts: StartProxyOptions): Promise<StartedProxy>
           return;
         }
 
+        req.off("close", onClientClose);
         const respText = await upstreamResp.text();
         res.writeHead(upstreamResp.status, {
           "content-type": upstreamResp.headers.get("content-type") ?? "application/json",

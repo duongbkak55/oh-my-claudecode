@@ -7,6 +7,10 @@ import { AddressInfo } from "net";
 import { DEFAULT_CONFIG, type ProxyConfig } from "../config.js";
 import { startProxy, type StartedProxy } from "../server.js";
 
+const AUTH: Record<string, string> = {
+  authorization: "Bearer test-client-token",
+};
+
 async function createMockUpstream(
   handler: (req: IncomingMessage, res: ServerResponse) => void,
 ): Promise<{ url: string; close: () => Promise<void> }> {
@@ -44,6 +48,9 @@ describe("proxy server integration", () => {
   beforeEach(() => {
     auditDir = mkdtempSync(join(tmpdir(), "omc-proxy-int-"));
     process.env.ANTHROPIC_API_KEY = "test-key";
+    process.env.OMC_PROXY_CLIENT_TOKEN = "test-client-token";
+    // Mock upstream uses http://127.0.0.1:<port>, so allow http here only.
+    process.env.OMC_PROXY_ALLOW_HTTP_UPSTREAM = "1";
   });
 
   afterEach(async () => {
@@ -82,19 +89,23 @@ describe("proxy server integration", () => {
       upstreamBaseUrlOverride: upstream.url,
     });
 
-    const m1 = await (await fetch(`http://127.0.0.1:${proxy.port}/metrics`)).text();
+    const m1 = await (
+      await fetch(`http://127.0.0.1:${proxy.port}/metrics`, { headers: AUTH })
+    ).text();
     expect(m1).toMatch(/omc_proxy_requests_total 0/);
 
     await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...AUTH },
       body: JSON.stringify({
         model: "claude-test",
         messages: [{ role: "user", content: "Hello world" }],
       }),
     });
 
-    const m2 = await (await fetch(`http://127.0.0.1:${proxy.port}/metrics`)).text();
+    const m2 = await (
+      await fetch(`http://127.0.0.1:${proxy.port}/metrics`, { headers: AUTH })
+    ).text();
     expect(m2).toMatch(/omc_proxy_requests_total 1/);
   });
 
@@ -108,7 +119,7 @@ describe("proxy server integration", () => {
     });
     const r = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...AUTH },
       body: JSON.stringify({
         model: "claude-test",
         messages: [
@@ -149,7 +160,7 @@ describe("proxy server integration", () => {
     });
     const r = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...AUTH },
       body: JSON.stringify({
         model: "claude-test",
         messages: [
@@ -193,7 +204,7 @@ describe("proxy server integration", () => {
     });
     const r = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...AUTH },
       body: JSON.stringify({
         model: "claude-test",
         stream: true,
@@ -211,7 +222,7 @@ describe("proxy server integration", () => {
     proxy = await startProxy({ config: baseConfig(auditDir) });
     const r = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...AUTH },
       body: JSON.stringify({ messages: [] }),
     });
     expect(r.status).toBe(500);
@@ -227,5 +238,128 @@ describe("proxy server integration", () => {
     await expect(startProxy({ config: cfg })).rejects.toThrow(
       /Refusing to bind/,
     );
+  });
+
+  describe("bearer-token auth", () => {
+    it("returns 401 when Authorization header is missing", async () => {
+      proxy = await startProxy({ config: baseConfig(auditDir) });
+      const r = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ messages: [] }),
+      });
+      expect(r.status).toBe(401);
+      const body = (await r.json()) as { error: string };
+      expect(body.error).toBe("unauthorized");
+    });
+
+    it("returns 401 when Authorization token is wrong", async () => {
+      proxy = await startProxy({ config: baseConfig(auditDir) });
+      const r = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer not-the-right-token",
+        },
+        body: JSON.stringify({ messages: [] }),
+      });
+      expect(r.status).toBe(401);
+    });
+
+    it("returns 200 on /v1/messages with correct token", async () => {
+      upstream = await createMockUpstream((_req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: "msg_1",
+            role: "assistant",
+            model: "claude-test",
+            content: [{ type: "text", text: "hi" }],
+          }),
+        );
+      });
+      proxy = await startProxy({
+        config: baseConfig(auditDir),
+        upstreamBaseUrlOverride: upstream.url,
+      });
+      const r = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...AUTH },
+        body: JSON.stringify({
+          model: "claude-test",
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      });
+      expect(r.status).toBe(200);
+    });
+
+    it("returns 503 when client-token env is NOT set", async () => {
+      delete process.env.OMC_PROXY_CLIENT_TOKEN;
+      proxy = await startProxy({ config: baseConfig(auditDir) });
+      const r = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ messages: [] }),
+      });
+      expect(r.status).toBe(503);
+      const body = (await r.json()) as { error: string };
+      expect(body.error).toMatch(/auth/);
+    });
+
+    it("/health is open (no auth required)", async () => {
+      proxy = await startProxy({ config: baseConfig(auditDir) });
+      const r = await fetch(`http://127.0.0.1:${proxy.port}/health`);
+      expect(r.status).toBe(200);
+    });
+
+    it("/metrics requires auth (401 without header)", async () => {
+      proxy = await startProxy({ config: baseConfig(auditDir) });
+      const r = await fetch(`http://127.0.0.1:${proxy.port}/metrics`);
+      expect(r.status).toBe(401);
+    });
+  });
+
+  it("does NOT leak an sk-ant secret split across SSE frames", async () => {
+    upstream = await createMockUpstream((_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+      });
+      const frames = [
+        "sk-",
+        "ant-",
+        "abcdefghijklmnopqrstuvwxyz1234567890ZZZZ",
+      ];
+      for (const text of frames) {
+        res.write(
+          `event: content_block_delta\n` +
+            `data: ${JSON.stringify({
+              type: "content_block_delta",
+              index: 0,
+              delta: { type: "text_delta", text },
+            })}\n\n`,
+        );
+      }
+      res.end();
+    });
+    proxy = await startProxy({
+      config: baseConfig(auditDir),
+      upstreamBaseUrlOverride: upstream.url,
+    });
+    const r = await fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...AUTH },
+      body: JSON.stringify({
+        model: "claude-test",
+        stream: true,
+        messages: [{ role: "user", content: "tell me something" }],
+      }),
+    });
+    const text = await r.text();
+    expect(text).not.toContain(
+      "sk-ant-abcdefghijklmnopqrstuvwxyz1234567890",
+    );
+    // Should include a dlp_blocked error frame.
+    expect(text).toContain("dlp_blocked");
   });
 });

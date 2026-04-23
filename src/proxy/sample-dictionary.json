@@ -1,0 +1,8 @@
+[
+  {"term": "@vng/zalo-pay-internal-sdk", "classifier": "INTERNAL_PACKAGE", "policy": "tokenize"},
+  {"term": "@acme/billing-core", "classifier": "INTERNAL_PACKAGE", "policy": "tokenize"},
+  {"term": "Project Bluefin", "classifier": "CODENAME", "policy": "tokenize"},
+  {"term": "Project Redwood", "classifier": "CODENAME", "policy": "tokenize"},
+  {"term": "Vietcombank", "classifier": "PARTNER_NAME", "policy": "tokenize"},
+  {"term": "gitlab.company.internal", "classifier": "INTERNAL_HOST", "policy": "tokenize"}
+]

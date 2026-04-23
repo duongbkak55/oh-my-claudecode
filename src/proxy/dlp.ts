@@ -10,6 +10,7 @@ import type { TokenVault } from "./vault.js";
 import { TOKEN_REGEX } from "./vault.js";
 import type { Dictionary, DictionaryMatch } from "./dictionary.js";
 import type { SqlLane } from "./sql-lane.js";
+import type { AstLane } from "./ast-lane.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const safeRegex: (re: RegExp | string) => boolean = safeRegexDefault as any;
@@ -103,6 +104,7 @@ export interface ApplyPolicyOptions {
   vault?: VaultContext;
   dictionary?: Dictionary;
   sqlLane?: SqlLane;
+  astLane?: AstLane;
 }
 
 interface ActionableMatch {
@@ -119,14 +121,22 @@ export function applyPolicy(
   patterns: CompiledPattern[],
   opts: ApplyPolicyOptions = {},
 ): ApplyPolicyResult {
-  // Pass 0: SQL lane (structural rewrite, may change text length). Runs first
-  // so regex/dict offsets remain valid on the already-SQL-masked output.
+  // Pass 0: structural lanes (SQL + AST). Both may change text length.
+  // Runs first so regex/dict offsets remain valid on the already-masked output.
+  // SQL lane operates on fenced ```sql blocks / line-anchored SQL; AST lane
+  // operates on fenced ```ts/js/py/java blocks — the two lane categories
+  // target disjoint fence tags, so ordering is safe.
   let workText = text;
-  const sqlMatches: DlpMatch[] = [];
+  const structuralMatches: DlpMatch[] = [];
   if (opts.sqlLane && opts.vault) {
-    const r = opts.sqlLane.apply(text, opts.vault);
+    const r = opts.sqlLane.apply(workText, opts.vault);
     workText = r.output;
-    for (const m of r.matches) sqlMatches.push(m);
+    for (const m of r.matches) structuralMatches.push(m);
+  }
+  if (opts.astLane && opts.vault) {
+    const r = opts.astLane.apply(workText, opts.vault);
+    workText = r.output;
+    for (const m of r.matches) structuralMatches.push(m);
   }
   const regexMatches = scan(workText, patterns);
   const dictMatches: DictionaryMatch[] = opts.dictionary
@@ -137,7 +147,7 @@ export function applyPolicy(
     dictMatches.some((m) => m.policy === "block");
   // Lift dictionary hits into DlpMatch[] for reporting uniformly. SQL-lane
   // matches are pre-populated (structural rewrites already applied upstream).
-  const allMatches: DlpMatch[] = [...sqlMatches, ...regexMatches];
+  const allMatches: DlpMatch[] = [...structuralMatches, ...regexMatches];
   for (const d of dictMatches) {
     allMatches.push({
       patternName: `dict:${d.classifier}`,

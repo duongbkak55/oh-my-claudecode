@@ -1,8 +1,16 @@
 node_modules/
 *.log
 .DS_Store
-.omc/
-.omc/
+# OMC runtime state stays ignored; project-scoped config + skills are
+# version-controlled per README.vi.md §"Kỹ năng Tùy chỉnh". Only the runtime
+# sub-paths below are excluded; .omc/project-memory.json and .omc/skills/
+# are tracked so the team shares routing rules and project skills.
+.omc/state/
+.omc/logs/
+.omc/plans/
+.omc/research/
+.omc/sessions/
+.omc/notepad.md
 .idea/
 .claude/
 

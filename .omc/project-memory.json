@@ -1,0 +1,118 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Yeachan-Heo/oh-my-claudecode/main/schemas/project-memory.schema.json",
+  "project": "oh-my-claudecode",
+  "notes": [
+    "AI egress proxy under src/proxy/ is the active P2 workstream (docs: docs/proxy/security-design.md).",
+    "Security-auditor pass produced 9-item backlog (Appendix C). Items C-1 through C-4 and C-7 through C-9 must close before P2 exits review."
+  ],
+  "proxy_file_routing": {
+    "description": "Per-file agent delegation + legal/compliance constraints for docs/proxy and src/proxy changes. Read this when touching any listed path BEFORE writing code.",
+    "rules": [
+      {
+        "paths": ["src/proxy/audit.ts", "src/proxy/__tests__/audit.test.ts"],
+        "agents": ["executor", "security-reviewer"],
+        "constraints": [
+          "NĐ 13/2023 Điều 27 khoản 1 điểm đ requires tamper-evidence for processing records. fsync is durability only, not integrity.",
+          "Planned hardening: HMAC chain h_n = HMAC-SHA256(K, h_{n-1} || canonical_json(event_n)) + daily WORM anchor. Spec in docs/proxy/security-design.md Appendix C-1.",
+          "Audit log MUST emit sha256(value)[:8], never plaintext — Appendix C-8 side-channel requirement."
+        ]
+      },
+      {
+        "paths": ["src/proxy/vault.ts", "src/proxy/__tests__/vault.test.ts"],
+        "agents": ["executor", "security-reviewer"],
+        "constraints": [
+          "Data-subject rights (NĐ 13/2023 Điều 14–17): right-to-access + right-to-erasure must map to vault ops. 72h response SLA per Điều 14 khoản 4. See Appendix C-7.",
+          "purgeExpired() exists but is NOT wired to setInterval in startProxy — B2 backlog item.",
+          "Do NOT hardcode TTL — always read from config.vault.ttlSeconds."
+        ]
+      },
+      {
+        "paths": ["src/proxy/dlp.ts", "src/proxy/dlp-vn.ts", "src/proxy/__tests__/dlp.test.ts"],
+        "agents": ["executor", "security-reviewer"],
+        "constraints": [
+          "Thông tư 59/2021/TT-BCA does NOT publish a CCCD check-digit algorithm. Any 'Luhn' or 'checksum' framing for CCCD is factually wrong.",
+          "Agreed CCCD validator = province-code allowlist (63 codes) + gender-century digit + year plausibility + contextual trigger regex. See Appendix C-5.",
+          "Upstream-response DLP pass is missing (Appendix C-8). Add scrubber before forwarding SSE chunks to client for SECRET.*, CCCD, BANK_ACCOUNT classifiers."
+        ]
+      },
+      {
+        "paths": ["src/proxy/fpe.ts"],
+        "agents": ["executor", "security-reviewer"],
+        "constraints": [
+          "Scheme MUST be FF3-1 per NIST SP 800-38G Rev.1 (2019). NOT FF1. NEVER original FF3 (withdrawn).",
+          "Block cipher = AES-256. Minimum domain size = 10^6. Excludes PINs, 6-digit OTPs, 3-digit province codes.",
+          "CCCD is NOT in FPE scope (tokenised instead) — see Appendix C-2 spec."
+        ]
+      },
+      {
+        "paths": ["src/proxy/bypass.ts"],
+        "agents": ["executor", "security-reviewer"],
+        "constraints": [
+          "CISO sign-off required before any code ships (Appendix C-3).",
+          "jti blacklist in Redis (cross-instance replay defense). POST /admin/bypass/revoke endpoint. RS256 rotated quarterly via JWKS with 7-day overlap.",
+          "Approval portal MFA must be WebAuthn/FIDO2 preferred; OIDC-MFA acceptable. Password + TOTP NOT sufficient.",
+          "NEVER-for-SECRET MUST be server-enforced by re-running DLP after bypass resolution. Advisory-only is non-compliant."
+        ]
+      },
+      {
+        "paths": ["src/proxy/server.ts", "src/proxy/__tests__/server.integration.test.ts"],
+        "agents": ["executor", "api-reviewer"],
+        "constraints": [
+          "HTTPS-only for upstream forward (already enforced in ab9ac90).",
+          "HITL permissions + backpressure hardening already applied (ab9ac90). Do not weaken.",
+          "Add §2 code cross-check annotations (Appendix C-9) when modifying inbound/outbound hook points — map each §2 claim in docs to the code line."
+        ]
+      },
+      {
+        "paths": ["src/proxy/agent-loop.ts"],
+        "agents": ["executor", "performance-reviewer"],
+        "constraints": [
+          "SSE rolling-buffer split-secret defense already applied (ab9ac90). Chunk boundaries must not bypass DLP.",
+          "Zod validation on upstream responses (already present) — do not bypass on 'fast path'."
+        ]
+      },
+      {
+        "paths": ["src/proxy/dictionary.ts", "src/proxy/sample-dictionary.json"],
+        "agents": ["executor"],
+        "constraints": [
+          "Dictionary hot-reload via chokidar file watcher is B5 backlog (behind OMC_PROXY_DICT_WATCH=1).",
+          "Aho-Corasick lookup is sub-millisecond — do not optimise prematurely."
+        ]
+      },
+      {
+        "paths": ["src/proxy/sql-lane.ts", "src/proxy/__tests__/sql-lane.test.ts"],
+        "agents": ["executor", "code-reviewer"],
+        "constraints": [
+          "Parse or sqlify failure = silent pass-through. NEVER throw past applyPolicy.",
+          "includeColumns opt-in only until Appendix C-6 A/B benchmark completes.",
+          "Column-qualifier tokenisation on column_ref MUST always run (regression guard test exists) — leaving it gated by includeColumns leaked users.id in JOIN ON-clauses."
+        ]
+      },
+      {
+        "paths": ["src/proxy/ast-lane.ts", "src/proxy/__tests__/ast-lane.test.ts"],
+        "agents": ["executor", "code-reviewer"],
+        "constraints": [
+          "B7 in-progress: behind OMC_PROXY_AST_DLP=1.",
+          "Parse failure MUST fall back to pass-through (same contract as sql-lane.ts).",
+          "p95 latency budget for code path ≤130 ms per design doc §6. Add a perf smoke test."
+        ]
+      },
+      {
+        "paths": ["docs/proxy/**"],
+        "agents": ["writer", "security-reviewer"],
+        "constraints": [
+          "All NĐ 13/2023 citations MUST name the specific Điều (article). Generic 'NĐ 13/2023' references are non-compliant per Appendix C audit.",
+          "Never reintroduce 'Luhn-like checksum' for CCCD — no such algorithm exists in Thông tư 59/2021."
+        ]
+      },
+      {
+        "paths": ["benchmarks/ner-vn/**"],
+        "agents": ["researcher"],
+        "constraints": [
+          "Admission gate for VN NER lane: precision ≥ 0.85, recall ≥ 0.70 on labelled dev-prompt test set (Appendix C-4).",
+          "Underthesea F1 on VLSP 2016/2018 news corpora does NOT substitute for dev-context benchmark."
+        ]
+      }
+    ]
+  }
+}

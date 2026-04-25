@@ -40,7 +40,7 @@ oh-my-claudecode (OMC) is a multi-agent orchestration layer that plugs into Clau
 - ~32 workflow skills covering persistence loops (ralph), maximum parallelism (ultrawork), full autonomous pipelines (autopilot), consensus planning (ralplan), tri-model orchestration (ccg), and many more.
 - Persistent state and memory (notepad, project memory, session-scoped files) that survives context compaction and cross-session breaks.
 - An `omc` CLI with ~18 named subcommands covering setup, team management, session search, worktree teleport, rate-limit waiting, notification configuration, and a HUD statusline renderer.
-- An AI egress proxy (now a standalone repo: <https://github.com/duongbkak55/omc-ai-proxy>) that intercepts outbound Anthropic API traffic, runs multi-lane DLP, and tokenises PII and source-code identifiers into opaque vault tokens — preventing accidental egress of personal data and proprietary code.
+- An AI egress proxy (now a standalone repo: <https://github.com/duongbkak55/ai-proxy>) that intercepts outbound Anthropic API traffic, runs multi-lane DLP, and tokenises PII and source-code identifiers into opaque vault tokens — preventing accidental egress of personal data and proprietary code.
 
 **What it is not:** OMC is not a replacement for Claude Code, not a new language model, not a self-hosted server you must run, and not an independent product. It is a plugin and orchestration layer that rides on top of Claude Code's existing hook, agent, and MCP infrastructure.
 
@@ -94,7 +94,7 @@ OMC is built on four interlocking systems that the canonical `docs/ARCHITECTURE.
   │  ~18 subcommands: setup, team, wait, teleport, ask, hud  │
   └─────────────────────────────────────────────────────────┘
   ┌─────────────────────────────────────────────────────────┐
-  │  PROXY  (now @omc-ai/proxy, separate repo)             │
+  │  PROXY  (now @duongbkak55/ai-proxy, separate repo)             │
   │  and api.anthropic.com; DLP + vault + audit log          │
   └─────────────────────────────────────────────────────────┘
   ┌─────────────────────────────────────────────────────────┐
@@ -869,7 +869,7 @@ The canonical guide is `docs/PERFORMANCE-MONITORING.md`. The analytics subsystem
 
 The AI egress proxy was originally implemented in this repo at `src/proxy/`, but has been **extracted into a standalone repository** to support deployment independent of the Claude Code plugin layer.
 
-**New home: <https://github.com/duongbkak55/omc-ai-proxy>** — package `@omc-ai/proxy`.
+**New home: <https://github.com/duongbkak55/ai-proxy>** — package `@duongbkak55/ai-proxy`.
 
 The proxy intercepts outbound Anthropic API traffic (`api.anthropic.com`), runs a multi-lane DLP pipeline (regex, Aho-Corasick dictionary, SQL AST, source-code AST), tokenises sensitive identifiers into opaque vault tokens, and detokenises them in the inbound SSE stream. It now also includes a multi-token bearer auth lane with rotation and per-token rate-limit (Phase B) and Docker/caddy/systemd deployment artifacts (Phase C).
 
@@ -1049,7 +1049,7 @@ To avoid confusion for new engineers, the following are explicitly outside the s
 
 - **A replacement for Claude Code**: OMC is a plugin that extends Claude Code. It requires Claude Code to be installed and running. It does not replace the Claude Code CLI, the Anthropic API, or any model.
 - **A new language model**: OMC is orchestration software. It uses Claude models (haiku, sonnet, opus) through the standard Anthropic API. It does not train, fine-tune, or serve any model.
-- **A self-hosted server**: OMC is not a server you deploy and run continuously. The AI egress proxy was extracted to a separate repo (<https://github.com/duongbkak55/omc-ai-proxy>) where it now ships with Docker / caddy / systemd deployment artifacts — but OMC itself remains a CLI plugin, not a server.
+- **A self-hosted server**: OMC is not a server you deploy and run continuously. The AI egress proxy was extracted to a separate repo (<https://github.com/duongbkak55/ai-proxy>) where it now ships with Docker / caddy / systemd deployment artifacts — but OMC itself remains a CLI plugin, not a server.
 - **A fork with changes to Claude's behaviour**: OMC does not patch Claude Code, modify model weights, or intercept model inference. It only operates at the hook and prompt level.
 - **Cross-platform support for Windows native terminal**: The CLI's tmux-dependent features (team workers, omc interop, omc wait detect) require tmux, which is not available on native Windows. A Win32 warning is displayed at startup. WSL is the recommended path for Windows users.
 - **A standalone MCP server**: OMC exposes MCP tools, but only for consumption by Claude Code agents running under the OMC plugin. It is not a standalone MCP server for arbitrary MCP clients.
@@ -1074,7 +1074,7 @@ To avoid confusion for new engineers, the following are explicitly outside the s
 | `docs/MIGRATION.md` | Migration paths: team MCP deprecation, v3.5.3 skill removals, v2.x → v3.0, v3.x → v4.0 | When upgrading from an older OMC version |
 | `docs/CJK-IME-KNOWN-ISSUES.md` | Root cause analysis and workarounds for Korean/Japanese/Chinese/Vietnamese input issues | When supporting CJK-language users |
 | `docs/LOCAL_PLUGIN_INSTALL.md` | Local development checkout install flow; worktree-aware plugin registration | When developing OMC itself from a local checkout |
-| `https://github.com/duongbkak55/omc-ai-proxy` | Standalone proxy repo (extracted from this repo) | When working on the AI egress proxy |
+| `https://github.com/duongbkak55/ai-proxy` | Standalone proxy repo (extracted from this repo) | When working on the AI egress proxy |
 | `CHANGELOG.md` | Version history with conventional commit entries | When reviewing what changed between versions |
 | `AGENTS.md` (root) | Condensed agent catalogue + tools + team pipeline + commit protocol used at runtime | The file Claude reads during sessions; keep in sync with `docs/ARCHITECTURE.md` |
 
@@ -1102,7 +1102,7 @@ To avoid confusion for new engineers, the following are explicitly outside the s
 - `docs/PERFORMANCE-MONITORING.md` — top section (60 lines)
 - `docs/SYNC-SYSTEM.md` — top section (60 lines)
 - `docs/LOCAL_PLUGIN_INSTALL.md` — top section (80 lines)
-- `omc-ai-proxy/README.md` and `omc-ai-proxy/docs/security-design.md` — for proxy-related work, consult the standalone repo
+- `ai-proxy/README.md` and `ai-proxy/docs/security-design.md` — for proxy-related work, consult the standalone repo
 - `src/cli/index.ts` — full read (CLI subcommand definitions)
 - `src/commands/index.ts` — full read (SDK command expansion)
 - `src/proxy/audit.ts` — observation 1074 (security audit findings)

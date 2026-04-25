@@ -88,6 +88,17 @@ export const ProxyConfigSchema = z.object({
       dialect: z.enum(["mysql", "postgres", "bigquery", "sqlite"]).default("mysql"),
     })
     .default({ enabled: false, includeColumns: false, dialect: "mysql" }),
+  astDlp: z
+    .object({
+      enabled: z.boolean().default(false),
+      languages: z
+        .array(z.enum(["typescript", "javascript", "python", "java"]))
+        .default(["typescript", "javascript", "python", "java"]),
+    })
+    .default({
+      enabled: false,
+      languages: ["typescript", "javascript", "python", "java"],
+    }),
 });
 
 export type DlpPattern = z.infer<typeof DlpPatternSchema>;
@@ -262,6 +273,19 @@ function envOverrides(): Partial<ProxyConfig> {
     }
   }
   if (Object.keys(sqlDlp).length > 0) out.sqlDlp = sqlDlp;
+
+  const astDlp: Record<string, unknown> = {};
+  if (process.env.OMC_PROXY_AST_DLP !== undefined) {
+    astDlp.enabled = process.env.OMC_PROXY_AST_DLP === "1";
+  }
+  if (process.env.OMC_PROXY_AST_DLP_LANGS) {
+    const allowed = new Set(["typescript", "javascript", "python", "java"]);
+    const raw = process.env.OMC_PROXY_AST_DLP_LANGS.split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter((s) => allowed.has(s));
+    if (raw.length > 0) astDlp.languages = raw;
+  }
+  if (Object.keys(astDlp).length > 0) out.astDlp = astDlp;
 
   return out as Partial<ProxyConfig>;
 }

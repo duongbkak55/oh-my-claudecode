@@ -20,6 +20,7 @@ import {
 import { InProcessTokenVault } from "./vault.js";
 import { Dictionary, type DictionaryEntry } from "./dictionary.js";
 import { SqlLane } from "./sql-lane.js";
+import { AstLane } from "./ast-lane.js";
 import { scanRequestForBannedTools, validateUpstreamUrl } from "./allowlist.js";
 import { auditEvent, summarizeMatches } from "./audit.js";
 import {
@@ -175,6 +176,12 @@ export async function startProxy(opts: StartProxyOptions): Promise<StartedProxy>
         enabled: true,
         includeColumns: config.sqlDlp.includeColumns,
         dialect: config.sqlDlp.dialect,
+      })
+    : undefined;
+  const astLane = config.astDlp.enabled
+    ? new AstLane({
+        enabled: true,
+        languages: config.astDlp.languages,
       })
     : undefined;
   const convHeaderLower = config.conversation.headerName.toLowerCase();
@@ -360,6 +367,7 @@ export async function startProxy(opts: StartProxyOptions): Promise<StartedProxy>
           vault: vaultCtx,
           dictionary,
           sqlLane,
+          astLane,
         });
         if (dlp.blocked) {
           metrics.blocked_total += 1;

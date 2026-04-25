@@ -40,7 +40,7 @@ oh-my-claudecode (OMC) is a multi-agent orchestration layer that plugs into Clau
 - ~32 workflow skills covering persistence loops (ralph), maximum parallelism (ultrawork), full autonomous pipelines (autopilot), consensus planning (ralplan), tri-model orchestration (ccg), and many more.
 - Persistent state and memory (notepad, project memory, session-scoped files) that survives context compaction and cross-session breaks.
 - An `omc` CLI with ~18 named subcommands covering setup, team management, session search, worktree teleport, rate-limit waiting, notification configuration, and a HUD statusline renderer.
-- An in-process AI egress proxy (`src/proxy/`) that intercepts outbound Anthropic API traffic, runs multi-lane DLP (regex, Aho-Corasick dictionary, SQL-AST, tree-sitter AST), tokenises PII and source-code identifiers into opaque vault tokens, and detokenises them in the inbound SSE stream — preventing accidental egress of personal data and proprietary code.
+- An AI egress proxy (now a standalone repo: <https://github.com/duongbkak55/omc-ai-proxy>) that intercepts outbound Anthropic API traffic, runs multi-lane DLP, and tokenises PII and source-code identifiers into opaque vault tokens — preventing accidental egress of personal data and proprietary code.
 
 **What it is not:** OMC is not a replacement for Claude Code, not a new language model, not a self-hosted server you must run, and not an independent product. It is a plugin and orchestration layer that rides on top of Claude Code's existing hook, agent, and MCP infrastructure.
 
@@ -94,7 +94,7 @@ OMC is built on four interlocking systems that the canonical `docs/ARCHITECTURE.
   │  ~18 subcommands: setup, team, wait, teleport, ask, hud  │
   └─────────────────────────────────────────────────────────┘
   ┌─────────────────────────────────────────────────────────┐
-  │  PROXY  (src/proxy/)  —  HTTP proxy between Claude Code  │
+  │  PROXY  (now @omc-ai/proxy, separate repo)             │
   │  and api.anthropic.com; DLP + vault + audit log          │
   └─────────────────────────────────────────────────────────┘
   ┌─────────────────────────────────────────────────────────┐
@@ -867,124 +867,15 @@ The canonical guide is `docs/PERFORMANCE-MONITORING.md`. The analytics subsystem
 
 ## 14. AI Egress Proxy
 
-The AI egress proxy is a first-class feature, not a bolt-on. It solves a concrete problem: when Claude Code sends prompts to `api.anthropic.com`, those prompts may contain personally identifiable information (names, identification numbers, contact details) or proprietary source code (internal package names, database schema identifiers, codenames, internal API endpoints). Organisations with data-handling obligations cannot allow this data to reach third-party cloud AI infrastructure without mitigation.
+The AI egress proxy was originally implemented in this repo at `src/proxy/`, but has been **extracted into a standalone repository** to support deployment independent of the Claude Code plugin layer.
 
-The proxy intercepts all outbound Anthropic API traffic, scans and tokenises sensitive content before forwarding, and reverses the tokenisation in the inbound response stream — ensuring that the model sees opaque tokens, not real values, while the developer's tool continues to receive the original values in tool outputs and completions.
+**New home: <https://github.com/duongbkak55/omc-ai-proxy>** — package `@omc-ai/proxy`.
 
-Implementation lives in `src/proxy/`. The handover document `docs/proxy/TODO.md` is the authoritative guide to what has been implemented, what is pending, and how to resume.
+The proxy intercepts outbound Anthropic API traffic (`api.anthropic.com`), runs a multi-lane DLP pipeline (regex, Aho-Corasick dictionary, SQL AST, source-code AST), tokenises sensitive identifiers into opaque vault tokens, and detokenises them in the inbound SSE stream. It now also includes a multi-token bearer auth lane with rotation and per-token rate-limit (Phase B) and Docker/caddy/systemd deployment artifacts (Phase C).
 
-### The problem
+For the full feature list, configuration reference, deployment guides, and security design, see the new repo's `README.md`, `docs/security-design.md`, `docs/auth.md`, and `deploy/README.md`.
 
-Without the proxy, a developer who asks Claude Code to "refactor this payment service" may inadvertently send:
-- Customer email addresses and phone numbers from test fixtures or logs.
-- Vietnamese national ID numbers (CCCD), tax codes (MST), or social insurance codes (BHXH) from sample data.
-- Internal package import paths that reveal proprietary architecture.
-- Database schema identifiers (table names, column names) that constitute trade secrets.
-- Codenames for unreleased products or internal systems.
-
-The proxy prevents this egress without requiring the developer to manually scrub their prompts.
-
-### The pipeline
-
-```
-Claude Code → omc-proxy (HTTP) → DLP pipeline → api.anthropic.com
-                                       │
-              ┌───────────────────────┐│┌──────────────────────────┐
-              │  1. Allowlist check   ││  (outbound)               │
-              │  2. Regex lane        ││                            │
-              │  3. Aho-Corasick dict ││  Sensitive values replaced │
-              │  4. SQL lane*         ││  with tokens: EMAIL_01,   │
-              │  5. AST lane**        ││  PKG_03, SCHEMA_USERS      │
-              │  6. Tokenise → vault  ││                            │
-              │  7. Audit log (fsync) ││                            │
-              │  8. HITL bypass***    ││                            │
-              └───────────────────────┘│└──────────────────────────┘
-                                       │
-              api.anthropic.com responds with tokens
-                                       │
-              ┌───────────────────────┐│┌──────────────────────────┐
-              │  SSE detokeniser      ││  (inbound)                │
-              │  Token → original     ││                            │
-              │  value from vault     ││  Developer sees real       │
-              │  Streamed to Claude   ││  values in output          │
-              └───────────────────────┘│└──────────────────────────┘
-```
-
-`*` Enabled by `OMC_PROXY_SQL_DLP=1`
-`**` Enabled by `OMC_PROXY_AST_DLP=1`
-`***` HITL (Human-in-the-Loop) bypass: **planned (P3)**, not yet implemented
-
-### Detection lanes
-
-The proxy runs multiple detection strategies in sequence:
-
-**Regex lane** (`src/proxy/dlp.ts` — `compilePatterns`, `applyPolicy`): Pattern-based detection compiled at startup with `safe-regex` validation to prevent ReDoS. Classifiers shipped:
-
-| Classifier | What it detects |
-|---|---|
-| `EMAIL` | Email addresses |
-| `PHONE` | Phone numbers |
-| `CCCD` | Vietnamese national ID (Căn cước công dân) — 12-digit structural heuristic |
-| `MST` | Vietnamese tax codes (Mã số thuế) |
-| `BHXH` | Vietnamese social insurance codes (Bảo hiểm xã hội) |
-| `BANK_ACCOUNT` | Bank account numbers |
-
-**Aho-Corasick dictionary lane** (`src/proxy/dictionary.ts`): Two automata (case-sensitive and case-insensitive) built from a configurable dictionary file (`src/proxy/sample-dictionary.json`). Suitable for codenames, internal project names, partner names. Supports hot-reload via file watcher (planned: Redis pub-sub for distributed reload).
-
-**SQL lane** (`src/proxy/sql-lane.ts`) — behind `OMC_PROXY_SQL_DLP=1`: Parses SQL text using `node-sql-parser`, walks the AST, and tokenises table names, column names, and schema identifiers. Re-serialises to valid SQL with tokens substituted. Preserves SQL parseability.
-
-**AST lane** (`src/proxy/ast-lane.ts`) — behind `OMC_PROXY_AST_DLP=1`: Uses tree-sitter to parse TypeScript, JavaScript, Python, and Java source code; identifies internal import paths and class path references for tokenisation.
-
-### Token vault and round-trip
-
-The vault (`src/proxy/vault.ts`) maps opaque tokens to original values. Tokens follow the pattern `{CLASSIFIER}_{NN}` (e.g., `EMAIL_01`, `PKG_03`). The `InProcessTokenVault` is a conversation-scoped in-memory map with a 24-hour TTL default. Each conversation (derived from the request session ID and body hash) has an isolated namespace.
-
-**Outbound:** `redactAnthropicRequest()` walks the entire JSON request body, replaces each detected value with its vault token, and optionally injects a system prompt instruction telling the model not to reproduce tokens verbatim.
-
-**Inbound SSE:** The `SseDetokenizer` class buffers incoming SSE chunks, parses `data:` lines, and replaces vault tokens with their original values before emitting to the client. A 512-byte rolling hold-back buffer (`HOLD_BACK = 512`, defined at `src/proxy/dlp.ts:488`) prevents split-token edge cases: the buffer grows across chunks within a content block, and on `content_block_stop` the full buffer is rescanned before final flush.
-
-**Non-streaming path:** `detokenizeValue()` walks the parsed response JSON and replaces tokens. Note: the non-streaming path does not apply a DLP scan to the upstream response content (only to the request); this is a known gap documented in the security audit (observation 1076).
-
-### Allowlist
-
-The allowlist (`src/proxy/allowlist.ts`) controls which tools and upstream URLs the proxy will forward. Tool scanning (`scanRequestForBannedTools`, line 323 of `server.ts`) runs before DLP. URL validation (`validateUpstreamUrl`, line 449) runs before forwarding. The proxy refuses to forward to non-allowlisted upstream endpoints.
-
-### Audit log
-
-`src/proxy/audit.ts` writes fsync'd audit log entries for each request/response cycle. The log format includes a counter and timestamp. Full tamper-evidence via HMAC chain is listed as P2 in the migration plan (currently the fsync provides durability but not tamper-evidence).
-
-### Authentication
-
-The proxy enforces bearer-token authentication on all non-`/health` routes using `constantTimeTokenMatch` (`crypto.timingSafeEqual`). The token is set via `OMC_PROXY_CLIENT_TOKEN`. Binding to public interfaces (`0.0.0.0` or `::`) is blocked unless `OMC_PROXY_ALLOW_PUBLIC=1` is explicitly set.
-
-### Starting the proxy
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-export OMC_PROXY_CLIENT_TOKEN=$(openssl rand -hex 32)
-npx tsx src/proxy/cli.ts start --port 11434
-```
-
-### Known gaps and planned work
-
-The following items are explicitly pending as of the HEAD commit (`f4861613`):
-
-| Item | Status |
-|---|---|
-| Redis-backed `TokenVault` (replace in-process vault for production) | Planned (P2) |
-| Vietnamese NER via Presidio + underthesea sidecar | Planned (P2) |
-| Dictionary hot-reload via Redis pub-sub | Planned (P2) |
-| `purgeExpired()` scheduled timer (method exists, not wired to `setInterval`) | Open TODO |
-| HMAC audit chain for NĐ 13/2023 Điều 27 tamper-evidence | Planned (P2, moved from P3) |
-| Bypass JWT workflow (15-min, maxUses=1, never for `SECRET.*`) | Planned (P3) |
-| KMS envelope encryption for vault DEK/KEK | Planned (P3) |
-| Multi-tenant vault isolation | Planned (P3) — partial schema (`tenantId` field) already in `config.ts` |
-| Upstream-response DLP scan on direct proxy path | Open gap — currently only the agent-loop path applies Zod validation |
-| Vietnamese NER precision/recall gating (≥0.85 / ≥0.70 on dev-context dataset) | Required before enabling underthesea in production |
-
-The `docs/proxy/TODO.md` file is the canonical handover document. The security design document (`docs/proxy/security-design.md`) was planned but had not been committed as of `f4861613`; per the TODO, its content should be generated from the TODO outline.
-
----
+The legacy in-tree implementation that lived at `src/proxy/` and `docs/proxy/` was removed in commit `claude/remove-proxy` (this branch). Its history is preserved both in this repo's git log under tag `archive/proxy-pre-split` and in the new repo's history (extracted via `git filter-repo`).
 
 ## 15. Agent Team Pipeline
 
@@ -1158,7 +1049,7 @@ To avoid confusion for new engineers, the following are explicitly outside the s
 
 - **A replacement for Claude Code**: OMC is a plugin that extends Claude Code. It requires Claude Code to be installed and running. It does not replace the Claude Code CLI, the Anthropic API, or any model.
 - **A new language model**: OMC is orchestration software. It uses Claude models (haiku, sonnet, opus) through the standard Anthropic API. It does not train, fine-tune, or serve any model.
-- **A self-hosted server**: OMC is not a server you deploy and run continuously. The AI egress proxy (`src/proxy/`) is an optional local HTTP proxy started on demand; it is not a production SaaS or a container you push to Kubernetes.
+- **A self-hosted server**: OMC is not a server you deploy and run continuously. The AI egress proxy was extracted to a separate repo (<https://github.com/duongbkak55/omc-ai-proxy>) where it now ships with Docker / caddy / systemd deployment artifacts — but OMC itself remains a CLI plugin, not a server.
 - **A fork with changes to Claude's behaviour**: OMC does not patch Claude Code, modify model weights, or intercept model inference. It only operates at the hook and prompt level.
 - **Cross-platform support for Windows native terminal**: The CLI's tmux-dependent features (team workers, omc interop, omc wait detect) require tmux, which is not available on native Windows. A Win32 warning is displayed at startup. WSL is the recommended path for Windows users.
 - **A standalone MCP server**: OMC exposes MCP tools, but only for consumption by Claude Code agents running under the OMC plugin. It is not a standalone MCP server for arbitrary MCP clients.
@@ -1183,7 +1074,7 @@ To avoid confusion for new engineers, the following are explicitly outside the s
 | `docs/MIGRATION.md` | Migration paths: team MCP deprecation, v3.5.3 skill removals, v2.x → v3.0, v3.x → v4.0 | When upgrading from an older OMC version |
 | `docs/CJK-IME-KNOWN-ISSUES.md` | Root cause analysis and workarounds for Korean/Japanese/Chinese/Vietnamese input issues | When supporting CJK-language users |
 | `docs/LOCAL_PLUGIN_INSTALL.md` | Local development checkout install flow; worktree-aware plugin registration | When developing OMC itself from a local checkout |
-| `docs/proxy/TODO.md` | Proxy feature handover: what is implemented, what is pending, how to resume | When working on the AI egress proxy |
+| `https://github.com/duongbkak55/omc-ai-proxy` | Standalone proxy repo (extracted from this repo) | When working on the AI egress proxy |
 | `CHANGELOG.md` | Version history with conventional commit entries | When reviewing what changed between versions |
 | `AGENTS.md` (root) | Condensed agent catalogue + tools + team pipeline + commit protocol used at runtime | The file Claude reads during sessions; keep in sync with `docs/ARCHITECTURE.md` |
 
@@ -1211,13 +1102,9 @@ To avoid confusion for new engineers, the following are explicitly outside the s
 - `docs/PERFORMANCE-MONITORING.md` — top section (60 lines)
 - `docs/SYNC-SYSTEM.md` — top section (60 lines)
 - `docs/LOCAL_PLUGIN_INSTALL.md` — top section (80 lines)
-- `docs/proxy/TODO.md` — full read
+- `omc-ai-proxy/README.md` and `omc-ai-proxy/docs/security-design.md` — for proxy-related work, consult the standalone repo
 - `src/cli/index.ts` — full read (CLI subcommand definitions)
 - `src/commands/index.ts` — full read (SDK command expansion)
-- `src/proxy/server.ts` — smart outline + observations 1075, 1076
-- `src/proxy/dlp.ts` — smart outline + observations 1075, 1076
-- `src/proxy/vault.ts` — smart outline + observations 1075, 1076
-- `src/proxy/config.ts` — smart outline + observations 1075
 - `src/proxy/audit.ts` — observation 1074 (security audit findings)
 - `src/proxy/allowlist.ts` — observation 1074
 - `hooks/hooks.json` — full read (parsed for hook event inventory)
